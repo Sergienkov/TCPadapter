@@ -205,67 +205,101 @@ func (s *Server) flushQueue(ctx context.Context, controllerID string) error {
 	remaining := maxBudget
 
 	for remaining > 0 {
-		cmd, ok := dctx.Queue.PopNext(time.Now().UTC(), dctx.FWMode, dctx.SyncMode)
-		if !ok {
+		scan := dctx.Queue.Len()
+		if scan == 0 {
 			return nil
 		}
-		if cmd.Expired(time.Now().UTC()) {
-			s.publishAck(ctx, kafka.AckEvent{
-				MessageID:    cmd.MessageID,
-				ControllerID: controllerID,
-				CommandID:    cmd.CommandID,
-				Status:       "expired",
-				Reason:       "ttl expired before send",
-			})
-			continue
-		}
-		if cmd.CommandID >= 12 && cmd.CommandID <= 16 {
-			s.sessions.SetSyncMode(controllerID, true)
-			dctx.SyncMode = true
-		}
-		if cmd.CommandID == 19 {
-			s.sessions.SetFWMode(controllerID, true)
-			dctx.FWMode = true
+		skipped := make([]queue.Command, 0)
+		sent := false
+
+		for i := 0; i < scan; i++ {
+			cmd, ok := dctx.Queue.PopNext(time.Now().UTC(), dctx.FWMode, dctx.SyncMode)
+			if !ok {
+				break
+			}
+			if cmd.Expired(time.Now().UTC()) {
+				s.publishAck(ctx, kafka.AckEvent{
+					MessageID:    cmd.MessageID,
+					ControllerID: controllerID,
+					CommandID:    cmd.CommandID,
+					Status:       "expired",
+					Reason:       "ttl expired before send",
+				})
+				continue
+			}
+			if !commandAllowedInModes(cmd.CommandID, dctx.FWMode, dctx.SyncMode) {
+				skipped = append(skipped, cmd)
+				continue
+			}
+			if cmd.CommandID >= 12 && cmd.CommandID <= 16 {
+				s.sessions.SetSyncMode(controllerID, true)
+				dctx.SyncMode = true
+			}
+			if cmd.CommandID == 19 {
+				s.sessions.SetFWMode(controllerID, true)
+				dctx.FWMode = true
+			}
+
+			payload := append([]byte{cmd.CommandID}, cmd.Payload...)
+			if err := protocol.ValidateServerCommandPayload(cmd.CommandID, cmd.Payload); err != nil {
+				s.publishAck(ctx, kafka.AckEvent{
+					MessageID:    cmd.MessageID,
+					ControllerID: controllerID,
+					CommandID:    cmd.CommandID,
+					Status:       "failed",
+					Reason:       fmt.Sprintf("invalid payload: %v", err),
+				})
+				continue
+			}
+			seq, err := s.sessions.NextCommandSeq(controllerID)
+			if err != nil {
+				for _, sCmd := range skipped {
+					dctx.Queue.Push(sCmd)
+				}
+				return err
+			}
+			frameBytes, err := protocol.EncodeFrame(protocol.Frame{TTL: ttlToWire(cmd.TTL), Seq: seq, Payload: payload})
+			if err != nil {
+				s.publishAck(ctx, kafka.AckEvent{MessageID: cmd.MessageID, ControllerID: controllerID, CommandID: cmd.CommandID, Status: "failed", Reason: err.Error()})
+				continue
+			}
+			if len(frameBytes) > remaining {
+				// Budget exhausted for this cycle. Put back and stop.
+				dctx.Queue.Push(cmd)
+				for _, sCmd := range skipped {
+					dctx.Queue.Push(sCmd)
+				}
+				return nil
+			}
+
+			_ = dctx.Conn.SetWriteDeadline(time.Now().Add(s.cfg.WriteTimeout))
+			if _, err := dctx.Conn.Write(frameBytes); err != nil {
+				s.publishAck(ctx, kafka.AckEvent{MessageID: cmd.MessageID, ControllerID: controllerID, CommandID: cmd.CommandID, Status: "failed", Reason: err.Error()})
+				for _, sCmd := range skipped {
+					dctx.Queue.Push(sCmd)
+				}
+				return err
+			}
+			if err := s.sessions.RegisterInFlight(controllerID, seq, cmd, time.Now().UTC()); err != nil {
+				s.publishAck(ctx, kafka.AckEvent{MessageID: cmd.MessageID, ControllerID: controllerID, CommandID: cmd.CommandID, Status: "failed", Reason: err.Error()})
+				for _, sCmd := range skipped {
+					dctx.Queue.Push(sCmd)
+				}
+				return err
+			}
+			remaining -= len(frameBytes)
+			s.publishAck(ctx, kafka.AckEvent{MessageID: cmd.MessageID, ControllerID: controllerID, CommandID: cmd.CommandID, Status: "accepted", CommandSeq: seq})
+			s.sessions.AckSent(controllerID)
+			sent = true
+			break
 		}
 
-		payload := append([]byte{cmd.CommandID}, cmd.Payload...)
-		if err := protocol.ValidateServerCommandPayload(cmd.CommandID, cmd.Payload); err != nil {
-			s.publishAck(ctx, kafka.AckEvent{
-				MessageID:    cmd.MessageID,
-				ControllerID: controllerID,
-				CommandID:    cmd.CommandID,
-				Status:       "failed",
-				Reason:       fmt.Sprintf("invalid payload: %v", err),
-			})
-			continue
+		for _, sCmd := range skipped {
+			dctx.Queue.Push(sCmd)
 		}
-		seq, err := s.sessions.NextCommandSeq(controllerID)
-		if err != nil {
-			return err
-		}
-		frameBytes, err := protocol.EncodeFrame(protocol.Frame{TTL: ttlToWire(cmd.TTL), Seq: seq, Payload: payload})
-		if err != nil {
-			s.publishAck(ctx, kafka.AckEvent{MessageID: cmd.MessageID, ControllerID: controllerID, CommandID: cmd.CommandID, Status: "failed", Reason: err.Error()})
-			continue
-		}
-		if len(frameBytes) > remaining {
-			// Budget exhausted for this cycle. Put back and stop.
-			dctx.Queue.Push(cmd)
+		if !sent {
 			return nil
 		}
-
-		_ = dctx.Conn.SetWriteDeadline(time.Now().Add(s.cfg.WriteTimeout))
-		if _, err := dctx.Conn.Write(frameBytes); err != nil {
-			s.publishAck(ctx, kafka.AckEvent{MessageID: cmd.MessageID, ControllerID: controllerID, CommandID: cmd.CommandID, Status: "failed", Reason: err.Error()})
-			return err
-		}
-		if err := s.sessions.RegisterInFlight(controllerID, seq, cmd, time.Now().UTC()); err != nil {
-			s.publishAck(ctx, kafka.AckEvent{MessageID: cmd.MessageID, ControllerID: controllerID, CommandID: cmd.CommandID, Status: "failed", Reason: err.Error()})
-			return err
-		}
-		remaining -= len(frameBytes)
-		s.publishAck(ctx, kafka.AckEvent{MessageID: cmd.MessageID, ControllerID: controllerID, CommandID: cmd.CommandID, Status: "accepted", CommandSeq: seq})
-		s.sessions.AckSent(controllerID)
 
 		if dctx.SyncMode && !dctx.Queue.HasSync() {
 			s.sessions.SetSyncMode(controllerID, false)
@@ -285,7 +319,11 @@ func (s *Server) EnqueueCommand(controllerID string, cmd queue.Command) error {
 	if cmd.CreatedAt.IsZero() {
 		cmd.CreatedAt = time.Now().UTC()
 	}
-	events, err := s.sessions.EnqueueWithEvents(controllerID, cmd)
+	normalized, err := normalizeCommandPriority(cmd)
+	if err != nil {
+		return err
+	}
+	events, err := s.sessions.EnqueueWithEvents(controllerID, normalized)
 	for _, e := range events {
 		s.recordOverflowMetric(e)
 	}

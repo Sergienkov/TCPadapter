@@ -5,6 +5,121 @@ import (
 	"fmt"
 )
 
+type Cmd1RegistrationAckPayload struct {
+	ExecutionCode uint8
+	ServerTime    uint32
+}
+
+func (p Cmd1RegistrationAckPayload) Build() ([]byte, error) {
+	out := make([]byte, 5)
+	out[0] = p.ExecutionCode
+	binary.LittleEndian.PutUint32(out[1:5], p.ServerTime)
+	if err := ValidateServerCommandPayload(1, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+type Cmd2RebootPayload struct {
+	TimeoutSec uint8
+}
+
+func (p Cmd2RebootPayload) Build() ([]byte, error) {
+	out := []byte{p.TimeoutSec}
+	if err := ValidateServerCommandPayload(2, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+type Cmd3FactoryResetPayload struct {
+	TimeoutSec uint8
+}
+
+func (p Cmd3FactoryResetPayload) Build() ([]byte, error) {
+	out := []byte{p.TimeoutSec}
+	if err := ValidateServerCommandPayload(3, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+type Cmd5TriggerPayload struct {
+	Flags [16]byte
+}
+
+func (p Cmd5TriggerPayload) Build() ([]byte, error) {
+	out := make([]byte, 16)
+	copy(out, p.Flags[:])
+	if err := ValidateServerCommandPayload(5, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+type Cmd6CaptureIDPayload struct {
+	CaptureTimeout uint8
+	Interface      uint8
+	NetworkAddress uint8
+}
+
+func (p Cmd6CaptureIDPayload) Build() ([]byte, error) {
+	out := []byte{p.CaptureTimeout, p.Interface, p.NetworkAddress}
+	if err := ValidateServerCommandPayload(6, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+type Cmd7PhotoRequestPayload struct {
+	CameraAddress uint8
+}
+
+func (p Cmd7PhotoRequestPayload) Build() ([]byte, error) {
+	out := []byte{p.CameraAddress}
+	if err := ValidateServerCommandPayload(7, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+type Cmd8OutputControlPayload struct {
+	SourceID uint8
+	Output1  uint8
+	Output2  uint8
+}
+
+func (p Cmd8OutputControlPayload) Build() ([]byte, error) {
+	out := []byte{p.SourceID, p.Output1, p.Output2}
+	if err := ValidateServerCommandPayload(8, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+type Cmd11SendSMSPayload struct {
+	Phone10 string
+	Message string
+}
+
+func (p Cmd11SendSMSPayload) Build() ([]byte, error) {
+	phone, err := fixedASCII(p.Phone10, 10)
+	if err != nil {
+		return nil, fmt.Errorf("cmd 11: phone: %w", err)
+	}
+	msg, err := fixedASCII(p.Message, 50)
+	if err != nil {
+		return nil, fmt.Errorf("cmd 11: message: %w", err)
+	}
+	out := make([]byte, 60)
+	copy(out[0:10], phone)
+	copy(out[10:60], msg)
+	if err := ValidateServerCommandPayload(11, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 type Cmd13SyncIDPayload struct {
 	Timestamp uint32
 	Records   [][]byte // each record is 32 bytes
@@ -202,9 +317,46 @@ func (p Cmd27CustomPayload) Build() ([]byte, error) {
 	return out, nil
 }
 
+type Cmd25BindingResponsePayload struct {
+	ErrorCode       uint8
+	ObjectNumberRaw []byte // must be <= 8 bytes, padded with zeros
+	ObjectName      string // <= 128 ASCII bytes
+	ControllerName  string // <= 128 ASCII bytes
+	AdminPhone      string // <= 16 ASCII bytes
+}
+
+func (p Cmd25BindingResponsePayload) Build() ([]byte, error) {
+	if len(p.ObjectNumberRaw) > 8 {
+		return nil, fmt.Errorf("cmd 25: object number too long: %d", len(p.ObjectNumberRaw))
+	}
+	name, err := fixedASCII(p.ObjectName, 128)
+	if err != nil {
+		return nil, fmt.Errorf("cmd 25: object name: %w", err)
+	}
+	controller, err := fixedASCII(p.ControllerName, 128)
+	if err != nil {
+		return nil, fmt.Errorf("cmd 25: controller name: %w", err)
+	}
+	phone, err := fixedASCII(p.AdminPhone, 16)
+	if err != nil {
+		return nil, fmt.Errorf("cmd 25: admin phone: %w", err)
+	}
+
+	out := make([]byte, 281)
+	out[0] = p.ErrorCode
+	copy(out[1:9], p.ObjectNumberRaw)
+	copy(out[9:137], name)
+	copy(out[137:265], controller)
+	copy(out[265:281], phone)
+	if err := ValidateServerCommandPayload(25, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func BuildEmptyPayload(commandID uint8) ([]byte, error) {
 	switch commandID {
-	case 17, 21, 22:
+	case 9, 10, 17, 21, 22:
 		if err := ValidateServerCommandPayload(commandID, nil); err != nil {
 			return nil, err
 		}
@@ -212,4 +364,18 @@ func BuildEmptyPayload(commandID uint8) ([]byte, error) {
 	default:
 		return nil, fmt.Errorf("command %d does not use empty payload builder", commandID)
 	}
+}
+
+func fixedASCII(s string, size int) ([]byte, error) {
+	if len(s) > size {
+		return nil, fmt.Errorf("too long: len=%d max=%d", len(s), size)
+	}
+	out := make([]byte, size)
+	for i := 0; i < len(s); i++ {
+		if s[i] > 127 {
+			return nil, fmt.Errorf("non-ascii byte at index %d", i)
+		}
+		out[i] = s[i]
+	}
+	return out, nil
 }

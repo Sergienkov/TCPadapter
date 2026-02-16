@@ -2,14 +2,18 @@ package server
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"tcpadapter/internal/kafka"
+	"tcpadapter/internal/protocol"
+	"tcpadapter/internal/queue"
 )
 
 func (s *Server) startObservability(ctx context.Context) {
@@ -28,6 +32,7 @@ func (s *Server) startObservability(ctx context.Context) {
 	})
 	mux.HandleFunc("/metrics", s.metricsHandler)
 	mux.HandleFunc("/debug/queues", s.debugQueuesHandler)
+	mux.HandleFunc("/debug/enqueue", s.debugEnqueueHandler)
 
 	httpSrv := &http.Server{Addr: s.cfg.MetricsAddr, Handler: mux}
 	go func() {
@@ -155,5 +160,86 @@ func (s *Server) debugQueuesHandler(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"count": len(stats),
 		"items": stats,
+	})
+}
+
+type debugEnqueueRequest struct {
+	ControllerID string `json:"controller_id"`
+	CommandID    uint8  `json:"command_id"`
+	TTLSeconds   int    `json:"ttl_seconds"`
+	PayloadHex   string `json:"payload_hex"`
+	MessageID    string `json:"message_id"`
+	DedupKey     string `json:"dedup_key"`
+}
+
+func (s *Server) debugEnqueueHandler(w http.ResponseWriter, r *http.Request) {
+	if !s.cfg.DebugLogs {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req debugEnqueueRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json body", http.StatusBadRequest)
+		return
+	}
+	req.ControllerID = strings.TrimSpace(req.ControllerID)
+	if req.ControllerID == "" {
+		http.Error(w, "controller_id is required", http.StatusBadRequest)
+		return
+	}
+	if req.CommandID == 0 {
+		http.Error(w, "command_id is required", http.StatusBadRequest)
+		return
+	}
+
+	payload := []byte(nil)
+	if strings.TrimSpace(req.PayloadHex) != "" {
+		decoded, err := hex.DecodeString(strings.TrimSpace(req.PayloadHex))
+		if err != nil {
+			http.Error(w, "payload_hex must be valid hex string", http.StatusBadRequest)
+			return
+		}
+		payload = decoded
+	}
+	if err := protocol.ValidateServerCommandPayload(req.CommandID, payload); err != nil {
+		http.Error(w, "invalid payload for command: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	ttl := time.Duration(req.TTLSeconds) * time.Second
+	if req.TTLSeconds < 0 {
+		http.Error(w, "ttl_seconds must be >= 0", http.StatusBadRequest)
+		return
+	}
+	messageID := strings.TrimSpace(req.MessageID)
+	if messageID == "" {
+		messageID = fmt.Sprintf("debug-%d", time.Now().UnixNano())
+	}
+
+	cmd := queue.Command{
+		MessageID: messageID,
+		DedupKey:  strings.TrimSpace(req.DedupKey),
+		CommandID: req.CommandID,
+		TTL:       ttl,
+		Payload:   payload,
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := s.EnqueueCommand(req.ControllerID, cmd); err != nil {
+		http.Error(w, "enqueue failed: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status":        "queued",
+		"controller_id": req.ControllerID,
+		"command_id":    req.CommandID,
+		"message_id":    messageID,
 	})
 }

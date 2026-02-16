@@ -41,7 +41,40 @@ func TestValidateServerCommandPayload_FWCommands(t *testing.T) {
 	}
 }
 
+func TestValidateServerCommandPayload_BaseCommands(t *testing.T) {
+	if err := ValidateServerCommandPayload(1, make([]byte, 5)); err != nil {
+		t.Fatalf("cmd1 valid payload rejected: %v", err)
+	}
+	if err := ValidateServerCommandPayload(2, []byte{1}); err != nil {
+		t.Fatalf("cmd2 valid payload rejected: %v", err)
+	}
+	if err := ValidateServerCommandPayload(3, []byte{1}); err != nil {
+		t.Fatalf("cmd3 valid payload rejected: %v", err)
+	}
+	if err := ValidateServerCommandPayload(5, make([]byte, 16)); err != nil {
+		t.Fatalf("cmd5 valid payload rejected: %v", err)
+	}
+	if err := ValidateServerCommandPayload(6, []byte{10, 3, 1}); err != nil {
+		t.Fatalf("cmd6 valid payload rejected: %v", err)
+	}
+	if err := ValidateServerCommandPayload(8, []byte{1, 1, 0}); err != nil {
+		t.Fatalf("cmd8 valid payload rejected: %v", err)
+	}
+	if err := ValidateServerCommandPayload(11, make([]byte, 60)); err != nil {
+		t.Fatalf("cmd11 valid payload rejected: %v", err)
+	}
+	if err := ValidateServerCommandPayload(25, make([]byte, 281)); err != nil {
+		t.Fatalf("cmd25 valid payload rejected: %v", err)
+	}
+}
+
 func TestValidateServerCommandPayload_Errors(t *testing.T) {
+	if err := ValidateServerCommandPayload(6, []byte{1, 9, 1}); err == nil {
+		t.Fatal("expected cmd6 interface range error")
+	}
+	if err := ValidateServerCommandPayload(8, []byte{1, 2, 0}); err == nil {
+		t.Fatal("expected cmd8 output value error")
+	}
 	if err := ValidateServerCommandPayload(17, []byte{1}); err == nil {
 		t.Fatal("expected cmd17 error")
 	}

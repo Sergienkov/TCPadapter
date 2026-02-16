@@ -9,6 +9,66 @@ import (
 // The payload here excludes command id byte (it is prepended by transport layer).
 func ValidateServerCommandPayload(commandID uint8, payload []byte) error {
 	switch commandID {
+	case 1:
+		// [execution_code=1][server_time=4]
+		if len(payload) != 5 {
+			return fmt.Errorf("cmd 1: payload must be 5 bytes, got=%d", len(payload))
+		}
+		return nil
+	case 2:
+		if len(payload) != 1 {
+			return fmt.Errorf("cmd 2: payload must be 1 byte, got=%d", len(payload))
+		}
+		return nil
+	case 3:
+		if len(payload) != 1 {
+			return fmt.Errorf("cmd 3: payload must be 1 byte, got=%d", len(payload))
+		}
+		return nil
+	case 5:
+		if len(payload) != 16 {
+			return fmt.Errorf("cmd 5: payload must be 16 bytes, got=%d", len(payload))
+		}
+		return nil
+	case 6:
+		// [capture_timeout=1][interface=1][network_address=1]
+		if len(payload) != 3 {
+			return fmt.Errorf("cmd 6: payload must be 3 bytes, got=%d", len(payload))
+		}
+		if payload[1] > 3 {
+			return fmt.Errorf("cmd 6: interface out of range: %d", payload[1])
+		}
+		return nil
+	case 7:
+		if len(payload) != 1 {
+			return fmt.Errorf("cmd 7: payload must be 1 byte, got=%d", len(payload))
+		}
+		return nil
+	case 8:
+		// [source=1][output1=1][output2=1]
+		if len(payload) != 3 {
+			return fmt.Errorf("cmd 8: payload must be 3 bytes, got=%d", len(payload))
+		}
+		if payload[1] > 1 || payload[2] > 1 {
+			return fmt.Errorf("cmd 8: output states must be 0 or 1")
+		}
+		return nil
+	case 9:
+		if len(payload) != 0 {
+			return fmt.Errorf("cmd 9: payload must be empty")
+		}
+		return nil
+	case 10:
+		if len(payload) != 0 {
+			return fmt.Errorf("cmd 10: payload must be empty")
+		}
+		return nil
+	case 11:
+		// [phone=10][message=50]
+		if len(payload) != 60 {
+			return fmt.Errorf("cmd 11: payload must be 60 bytes, got=%d", len(payload))
+		}
+		return nil
 	case 12:
 		// [timestamp=4][count=1][count*608 bytes] (strict fixed block for settings)
 		if len(payload) < 5 {
@@ -125,15 +185,19 @@ func ValidateServerCommandPayload(commandID uint8, payload []byte) error {
 		}
 		return nil
 	case 23:
-		// server time as uint32
 		if len(payload) != 4 {
 			return fmt.Errorf("cmd 23: payload must be 4 bytes, got=%d", len(payload))
 		}
 		return nil
 	case 24:
-		// [command_seq=1][execution_code=1]
 		if len(payload) != 2 {
 			return fmt.Errorf("cmd 24: payload must be 2 bytes")
+		}
+		return nil
+	case 25:
+		// [error_code=1][object_number=8][object_name=128][controller_name=128][admin_phone=16]
+		if len(payload) != 281 {
+			return fmt.Errorf("cmd 25: payload must be 281 bytes, got=%d", len(payload))
 		}
 		return nil
 	case 27:

@@ -68,6 +68,24 @@ go run ./cmd/tcpadapter
 go build ./cmd/tcpadapter
 ```
 
+### Быстрые команды через Makefile
+
+```bash
+make test
+make build
+make run-adapter
+make run-sim
+make stress
+make smoke
+```
+
+По умолчанию:
+
+- `ADAPTER_ADDR=:15010`
+- `METRICS_ADDR=:18080`
+- `SIM_ADDR=127.0.0.1:15010`
+- `SIM_CLIENTS=10`
+
 ## Конфигурация (env)
 
 - `TCPADAPTER_LISTEN_ADDR` (default `:15010`) — TCP порт адаптера.
@@ -85,7 +103,7 @@ go build ./cmd/tcpadapter
 - `TCPADAPTER_MAX_RETRIES` (default `3`) — максимум повторных отправок.
 - `TCPADAPTER_SWEEP_INTERVAL` (default `2s`) — интервал фонового sweeper.
 - `TCPADAPTER_STATE_FILE` (default `.data/sessions.json`) — файл состояния.
-- `TCPADAPTER_DEBUG` (default `false`) — включает debug-функции (`/debug/queues`).
+- `TCPADAPTER_DEBUG` (default `false`) — включает debug-функции (`/debug/queues`, `/debug/enqueue`).
 
 ## HTTP endpoints
 
@@ -93,6 +111,7 @@ go build ./cmd/tcpadapter
 - `GET /readyz` -> `200 OK`
 - `GET /metrics` -> Prometheus text format
 - `GET /debug/queues?limit=20` -> JSON с топом контроллеров по нагрузке очереди (только если `TCPADAPTER_DEBUG=true`)
+- `POST /debug/enqueue` -> ручная постановка команды в очередь контроллера (только если `TCPADAPTER_DEBUG=true`)
 
 Пример ответа `/debug/queues`:
 
@@ -112,6 +131,31 @@ go build ./cmd/tcpadapter
 }
 ```
 
+Пример запроса `/debug/enqueue`:
+
+```bash
+curl -X POST http://127.0.0.1:18080/debug/enqueue \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "controller_id":"860000000000001",
+    "command_id":9,
+    "ttl_seconds":10,
+    "message_id":"manual-1"
+  }'
+```
+
+Пример команды с payload в hex (например `cmd=8`):
+
+```bash
+curl -X POST http://127.0.0.1:18080/debug/enqueue \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "controller_id":"860000000000001",
+    "command_id":8,
+    "payload_hex":"010100"
+  }'
+```
+
 ## Основные метрики
 
 - `tcpadapter_active_connections`
@@ -126,6 +170,7 @@ go build ./cmd/tcpadapter
 ## Структура проекта
 
 - `cmd/tcpadapter` — точка входа.
+- `cmd/controller-sim` — эмулятор нескольких TCP-контроллеров.
 - `internal/config` — загрузка/валидация конфигурации.
 - `internal/server` — TCP сервер, sweeper, HTTP observability.
 - `internal/session` — сессии контроллеров, очереди, in-flight, overflow.
@@ -144,3 +189,54 @@ go build ./cmd/tcpadapter
 1. Подключить реальный Kafka клиент и контракты топиков.
 2. Довести полный набор протокольных команд и строгую валидацию payload.
 3. Добавить интеграционные тесты TCP<->broker и нагрузочные тесты на целевую емкость.
+
+## Ручной e2e тест без Kafka
+
+1. Запустить адаптер:
+
+```bash
+TCPADAPTER_DEBUG=true go run ./cmd/tcpadapter
+```
+
+2. Запустить эмулятор контроллеров:
+
+```bash
+go run ./cmd/controller-sim --addr 127.0.0.1:15010 --clients 10 --status-interval 3s
+```
+
+Нагрузочные режимы эмулятора:
+
+- `--ack-delay=200ms` — задержка перед `ack11`.
+- `--ack-error-rate=0.2` — 20% ack с кодом ошибки.
+- `--ack-drop-rate=0.1` — 10% команд без ack.
+- `--status-burst-size=5` — 5 status-пакетов за тик.
+- `--status-burst-spacing=20ms` — интервал между пакетами в burst.
+
+Пример стресс-режима:
+
+```bash
+go run ./cmd/controller-sim \
+  --addr 127.0.0.1:15010 \
+  --clients 50 \
+  --status-interval 2s \
+  --ack-delay 300ms \
+  --ack-error-rate 0.15 \
+  --ack-drop-rate 0.1 \
+  --status-burst-size 4 \
+  --status-burst-spacing 25ms
+```
+
+3. Подать команду в очередь через debug API:
+
+```bash
+curl -X POST http://127.0.0.1:18080/debug/enqueue \
+  -H 'Content-Type: application/json' \
+  -d '{"controller_id":"860000000000000","command_id":9}'
+```
+
+4. Проверить метрики и состояние очередей:
+
+```bash
+curl http://127.0.0.1:18080/metrics
+curl 'http://127.0.0.1:18080/debug/queues?limit=20'
+```

@@ -131,3 +131,39 @@ func TestDebugQueuesHandler_Disabled(t *testing.T) {
 		t.Fatalf("expected 404 when debug disabled, got %d", rr.Code)
 	}
 }
+
+func TestDebugEnqueueHandler(t *testing.T) {
+	cfg := config.Config{DebugLogs: true}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	sessions := session.NewManager(10, 100, 1048576, "drop_oldest", store.NewInMemoryStore())
+	srv := New(cfg, logger, sessions, noopBus{})
+
+	body := `{"controller_id":"imei-debug","command_id":9,"ttl_seconds":5}`
+	req := httptest.NewRequest("POST", "/debug/enqueue", strings.NewReader(body))
+	rr := httptest.NewRecorder()
+	srv.debugEnqueueHandler(rr, req)
+	if rr.Code != 202 {
+		t.Fatalf("expected 202, got %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	ctx, ok := sessions.DeliveryContext("imei-debug")
+	if !ok || ctx.Queue.Len() != 1 {
+		t.Fatalf("expected command in queue, ok=%v len=%d", ok, ctx.Queue.Len())
+	}
+}
+
+func TestDebugEnqueueHandler_BadPayload(t *testing.T) {
+	cfg := config.Config{DebugLogs: true}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	sessions := session.NewManager(10, 100, 1048576, "drop_oldest", store.NewInMemoryStore())
+	srv := New(cfg, logger, sessions, noopBus{})
+
+	// cmd20 requires 1026 bytes payload.
+	body := `{"controller_id":"imei-debug","command_id":20,"payload_hex":"AA"}`
+	req := httptest.NewRequest("POST", "/debug/enqueue", strings.NewReader(body))
+	rr := httptest.NewRecorder()
+	srv.debugEnqueueHandler(rr, req)
+	if rr.Code != 400 {
+		t.Fatalf("expected 400, got %d", rr.Code)
+	}
+}
