@@ -563,6 +563,20 @@ func (m *Manager) AckInFlight(controllerID string, seq uint8) (queue.Command, in
 	return entry.Command, entry.Attempts, true
 }
 
+func (m *Manager) PeekInFlight(controllerID string, seq uint8) (queue.Command, int, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	s, ok := m.sessions[controllerID]
+	if !ok {
+		return queue.Command{}, 0, false
+	}
+	entry, ok := s.InFlight[seq]
+	if !ok {
+		return queue.Command{}, 0, false
+	}
+	return entry.Command, entry.Attempts, true
+}
+
 func (m *Manager) ProcessInFlight(controllerID string, now time.Time, ackTimeout, retryBackoff time.Duration, maxRetries int) ([]InFlightOutcome, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

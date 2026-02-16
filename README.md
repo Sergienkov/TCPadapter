@@ -167,6 +167,24 @@ curl -X POST http://127.0.0.1:18080/debug/enqueue \
 - `tcpadapter_queue_bytes_sum`, `tcpadapter_queue_bytes_max`
 - `tcpadapter_inflight_sum`, `tcpadapter_inflight_max`
 
+## ACK11 Семантика
+
+Коды `ack11` от контроллера интерпретируются так:
+
+- `0` -> `delivered` (terminal)
+- `1` -> `failed` (`parameter_error`, terminal)
+- `2` -> `failed` (`execution_error`, terminal)
+- `3` -> `failed` (`invalid_result`, terminal)
+- `4` -> `failed` (`password_required`, terminal)
+- `5` -> `in_progress` (non-terminal, in-flight сохраняется)
+- `6` -> `expired` (`stale_command`, terminal)
+- `254` -> `failed` (`crc_error`, terminal)
+- `255` -> `unsupported` (`command_not_supported`, terminal)
+- неизвестный код -> `failed` (`unknown_code`, terminal)
+
+Terminal-коды снимают команду из `in-flight`.  
+`in_progress` не снимает команду и ожидается последующий terminal ack.
+
 ## Структура проекта
 
 - `cmd/tcpadapter` — точка входа.
@@ -240,3 +258,62 @@ curl -X POST http://127.0.0.1:18080/debug/enqueue \
 curl http://127.0.0.1:18080/metrics
 curl 'http://127.0.0.1:18080/debug/queues?limit=20'
 ```
+
+## Test Playbook
+
+Ниже рекомендуемый порядок ручной/полуавтоматической проверки без Kafka.
+
+1. Базовая живость
+
+```bash
+make run-adapter
+curl -f http://127.0.0.1:18080/healthz
+curl -f http://127.0.0.1:18080/readyz
+```
+
+2. Подключения контроллеров и heartbeat
+
+```bash
+make run-sim
+curl http://127.0.0.1:18080/metrics | rg 'active_connections|online_sessions_total|sessions_total'
+```
+
+Ожидаемо:
+- `tcpadapter_active_connections > 0`
+- `tcpadapter_online_sessions_total > 0`
+
+3. Ручная инъекция команды
+
+```bash
+make smoke
+```
+
+Ожидаемо:
+- команда появляется в очереди (`/debug/queues`)
+- в метриках растёт `tcpadapter_ack_total{status="accepted"}`
+
+4. Retry/TTL сценарии
+
+```bash
+go run ./cmd/controller-sim --addr 127.0.0.1:15010 --clients 10 --ack-drop-rate 0.3
+```
+
+Ожидаемо:
+- растут `retrying`, затем `delivered` или `expired` в `tcpadapter_ack_total`
+- `tcpadapter_inflight_sum` не зависает на постоянном росте
+
+5. Overflow сценарии
+
+Запускать с малыми лимитами (`TCPADAPTER_QUEUE_MAX_DEPTH=1`) и подавать команды через `/debug/enqueue`.
+
+Ожидаемо:
+- `reject`: растёт `tcpadapter_queue_overflow_total{...,action="rejected"}`
+- `drop_oldest`: растёт `...{...,action="dropped"}`
+
+6. Восстановление после рестарта
+
+Запускать с `TCPADAPTER_STATE_FILE` на диске, enqueue оффлайн-команды, перезапускать адаптер.
+
+Ожидаемо:
+- после рестарта очереди восстанавливаются
+- при reconnect контроллера команды доходят до `delivered`

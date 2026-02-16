@@ -52,3 +52,24 @@ func TestParseAck11Payload(t *testing.T) {
 		t.Fatalf("unexpected ack parse: %+v", ack)
 	}
 }
+
+func TestInterpretAck11ExecutionCode(t *testing.T) {
+	cases := []struct {
+		code     uint8
+		status   string
+		terminal bool
+	}{
+		{0, "delivered", true},
+		{5, "in_progress", false},
+		{6, "expired", true},
+		{255, "unsupported", true},
+		{99, "failed", true},
+	}
+
+	for _, tc := range cases {
+		got := InterpretAck11ExecutionCode(tc.code)
+		if got.Status != tc.status || got.Terminal != tc.terminal {
+			t.Fatalf("code=%d got=%+v", tc.code, got)
+		}
+	}
+}

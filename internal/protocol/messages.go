@@ -110,3 +110,34 @@ func IsFWFinished(progress uint8) bool {
 func IsFWFailed(progress uint8) bool {
 	return progress >= 249 && progress <= 255
 }
+
+type Ack11Status struct {
+	Status   string
+	Terminal bool
+	Reason   string
+}
+
+func InterpretAck11ExecutionCode(code uint8) Ack11Status {
+	switch code {
+	case 0:
+		return Ack11Status{Status: "delivered", Terminal: true, Reason: "ok"}
+	case 1:
+		return Ack11Status{Status: "failed", Terminal: true, Reason: "parameter_error"}
+	case 2:
+		return Ack11Status{Status: "failed", Terminal: true, Reason: "execution_error"}
+	case 3:
+		return Ack11Status{Status: "failed", Terminal: true, Reason: "invalid_result"}
+	case 4:
+		return Ack11Status{Status: "failed", Terminal: true, Reason: "password_required"}
+	case 5:
+		return Ack11Status{Status: "in_progress", Terminal: false, Reason: "command_started"}
+	case 6:
+		return Ack11Status{Status: "expired", Terminal: true, Reason: "stale_command"}
+	case 254:
+		return Ack11Status{Status: "failed", Terminal: true, Reason: "crc_error"}
+	case 255:
+		return Ack11Status{Status: "unsupported", Terminal: true, Reason: "command_not_supported"}
+	default:
+		return Ack11Status{Status: "failed", Terminal: true, Reason: "unknown_code"}
+	}
+}

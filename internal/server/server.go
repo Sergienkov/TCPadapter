@@ -150,28 +150,35 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 			ack, err := protocol.ParseAck11Payload(frame.Payload)
 			if err == nil {
 				s.sessions.UpdateBufferFree(controllerID, int(ack.BufferFreeBytes))
-				if ack.ExecutionCode == 0 {
+				interp := protocol.InterpretAck11ExecutionCode(ack.ExecutionCode)
+				if interp.Terminal {
 					if cmd, attempts, ok := s.sessions.AckInFlight(controllerID, ack.CommandSeq); ok {
 						s.publishAck(ctx, kafka.AckEvent{
 							MessageID:    cmd.MessageID,
 							ControllerID: controllerID,
 							CommandID:    cmd.CommandID,
 							CommandSeq:   ack.CommandSeq,
-							Status:       "delivered",
-							Reason:       fmt.Sprintf("attempts=%d", attempts),
+							Status:       interp.Status,
+							Reason:       fmt.Sprintf("%s; code=%d; attempts=%d", interp.Reason, ack.ExecutionCode, attempts),
 						})
 					}
-				} else if ack.ExecutionCode != 5 {
-					if cmd, _, ok := s.sessions.AckInFlight(controllerID, ack.CommandSeq); ok {
-						s.publishAck(ctx, kafka.AckEvent{
-							MessageID:    cmd.MessageID,
-							ControllerID: controllerID,
-							CommandID:    cmd.CommandID,
-							CommandSeq:   ack.CommandSeq,
-							Status:       "failed",
-							Reason:       fmt.Sprintf("controller execution code=%d", ack.ExecutionCode),
-						})
+				} else {
+					// Non-terminal update (e.g. command started). Keep in-flight entry.
+					msgID := fmt.Sprintf("inflight-%s-%d", controllerID, ack.CommandSeq)
+					cmdID := uint8(0)
+					if cmd, attempts, ok := s.sessions.PeekInFlight(controllerID, ack.CommandSeq); ok {
+						msgID = cmd.MessageID
+						cmdID = cmd.CommandID
+						_ = attempts
 					}
+					s.publishAck(ctx, kafka.AckEvent{
+						MessageID:    msgID,
+						ControllerID: controllerID,
+						CommandID:    cmdID,
+						CommandSeq:   ack.CommandSeq,
+						Status:       interp.Status,
+						Reason:       fmt.Sprintf("%s; code=%d", interp.Reason, ack.ExecutionCode),
+					})
 				}
 			}
 		case 4:
