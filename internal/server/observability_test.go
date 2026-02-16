@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net"
@@ -81,5 +82,52 @@ func queueCommand(payloadLen int) queue.Command {
 		Priority:  queue.PriorityHigh,
 		CreatedAt: time.Now().UTC(),
 		Payload:   make([]byte, payloadLen),
+	}
+}
+
+func TestDebugQueuesHandler(t *testing.T) {
+	cfg := config.Config{DebugLogs: true}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	sessions := session.NewManager(10, 100, 1048576, "drop_oldest", store.NewInMemoryStore())
+	srv := New(cfg, logger, sessions, noopBus{})
+
+	_ = sessions.Enqueue("imei-a", queueCommand(10))
+	_ = sessions.Enqueue("imei-a", queueCommand(20))
+	_ = sessions.Enqueue("imei-b", queueCommand(10))
+
+	req := httptest.NewRequest("GET", "/debug/queues?limit=1", nil)
+	rr := httptest.NewRecorder()
+	srv.debugQueuesHandler(rr, req)
+
+	if rr.Code != 200 {
+		t.Fatalf("unexpected status: %d", rr.Code)
+	}
+
+	var payload struct {
+		Count int                           `json:"count"`
+		Items []session.ControllerQueueStat `json:"items"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("json decode error: %v", err)
+	}
+	if payload.Count != 1 {
+		t.Fatalf("expected count=1, got %d", payload.Count)
+	}
+	if len(payload.Items) != 1 || payload.Items[0].ControllerID != "imei-a" {
+		t.Fatalf("unexpected items: %+v", payload.Items)
+	}
+}
+
+func TestDebugQueuesHandler_Disabled(t *testing.T) {
+	cfg := config.Config{DebugLogs: false}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	sessions := session.NewManager(10, 100, 1048576, "drop_oldest", store.NewInMemoryStore())
+	srv := New(cfg, logger, sessions, noopBus{})
+
+	req := httptest.NewRequest("GET", "/debug/queues", nil)
+	rr := httptest.NewRecorder()
+	srv.debugQueuesHandler(rr, req)
+	if rr.Code != 404 {
+		t.Fatalf("expected 404 when debug disabled, got %d", rr.Code)
 	}
 }

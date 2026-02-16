@@ -2,9 +2,11 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 
 	"tcpadapter/internal/kafka"
@@ -25,6 +27,7 @@ func (s *Server) startObservability(ctx context.Context) {
 		_, _ = w.Write([]byte("ok\n"))
 	})
 	mux.HandleFunc("/metrics", s.metricsHandler)
+	mux.HandleFunc("/debug/queues", s.debugQueuesHandler)
 
 	httpSrv := &http.Server{Addr: s.cfg.MetricsAddr, Handler: mux}
 	go func() {
@@ -129,4 +132,28 @@ func parseOverflowKey(key string) map[string]string {
 		out[kv[0]] = kv[1]
 	}
 	return out
+}
+
+func (s *Server) debugQueuesHandler(w http.ResponseWriter, r *http.Request) {
+	if !s.cfg.DebugLogs {
+		http.NotFound(w, r)
+		return
+	}
+
+	limit := 20
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil && v > 0 {
+			if v > 200 {
+				v = 200
+			}
+			limit = v
+		}
+	}
+
+	stats := s.sessions.TopQueueStats(limit)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"count": len(stats),
+		"items": stats,
+	})
 }

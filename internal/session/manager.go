@@ -3,6 +3,7 @@ package session
 import (
 	"errors"
 	"net"
+	"sort"
 	"sync"
 	"time"
 
@@ -82,6 +83,15 @@ type Stats struct {
 	InFlightCountSum   int
 	InFlightCountMax   int
 	OnlineSessionCount int
+}
+
+type ControllerQueueStat struct {
+	ControllerID string    `json:"controller_id"`
+	QueueDepth   int       `json:"queue_depth"`
+	QueueBytes   int       `json:"queue_bytes"`
+	InFlight     int       `json:"in_flight"`
+	Online       bool      `json:"online"`
+	LastSeen     time.Time `json:"last_seen"`
 }
 
 func NewManager(maxConns, maxQueueDepth, maxQueueBytes int, overflowPolicy string, st store.Store) *Manager {
@@ -481,6 +491,42 @@ func (m *Manager) SnapshotStats() Stats {
 		}
 	}
 	return st
+}
+
+func (m *Manager) TopQueueStats(limit int) []ControllerQueueStat {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if limit <= 0 {
+		limit = 20
+	}
+
+	out := make([]ControllerQueueStat, 0, len(m.sessions))
+	for _, s := range m.sessions {
+		out = append(out, ControllerQueueStat{
+			ControllerID: s.ControllerID,
+			QueueDepth:   s.Queue.Len(),
+			QueueBytes:   s.Queue.TotalEstimatedBytes(),
+			InFlight:     len(s.InFlight),
+			Online:       s.Conn != nil,
+			LastSeen:     s.LastSeen,
+		})
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].QueueDepth != out[j].QueueDepth {
+			return out[i].QueueDepth > out[j].QueueDepth
+		}
+		if out[i].InFlight != out[j].InFlight {
+			return out[i].InFlight > out[j].InFlight
+		}
+		return out[i].ControllerID < out[j].ControllerID
+	})
+
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out
 }
 
 func (m *Manager) RegisterInFlight(controllerID string, seq uint8, cmd queue.Command, sentAt time.Time) error {
