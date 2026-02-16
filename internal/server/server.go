@@ -229,6 +229,16 @@ func (s *Server) flushQueue(ctx context.Context, controllerID string) error {
 		}
 
 		payload := append([]byte{cmd.CommandID}, cmd.Payload...)
+		if err := protocol.ValidateServerCommandPayload(cmd.CommandID, cmd.Payload); err != nil {
+			s.publishAck(ctx, kafka.AckEvent{
+				MessageID:    cmd.MessageID,
+				ControllerID: controllerID,
+				CommandID:    cmd.CommandID,
+				Status:       "failed",
+				Reason:       fmt.Sprintf("invalid payload: %v", err),
+			})
+			continue
+		}
 		seq, err := s.sessions.NextCommandSeq(controllerID)
 		if err != nil {
 			return err
