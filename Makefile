@@ -1,4 +1,4 @@
-.PHONY: test build fmt run-adapter run-sim stress smoke clean
+.PHONY: test build fmt run-adapter run-sim stress stress-run smoke clean docker-build docker-up docker-up-with-sim docker-down docker-logs docker-ps
 
 ADAPTER_ADDR ?= :15010
 METRICS_ADDR ?= :18080
@@ -38,6 +38,10 @@ stress:
 		--status-burst-size 4 \
 		--status-burst-spacing 25ms
 
+stress-run:
+	chmod +x ./scripts/stress_run.sh
+	./scripts/stress_run.sh
+
 smoke:
 	curl -fsS http://127.0.0.1$(METRICS_ADDR)/healthz
 	curl -fsS http://127.0.0.1$(METRICS_ADDR)/readyz
@@ -49,3 +53,21 @@ smoke:
 
 clean:
 	rm -f tcpadapter controller-sim
+
+docker-build:
+	docker compose build
+
+docker-up:
+	docker compose up -d adapter
+
+docker-up-with-sim:
+	docker compose --profile sim up -d
+
+docker-down:
+	docker compose down
+
+docker-logs:
+	docker compose logs -f --tail=200 adapter
+
+docker-ps:
+	docker compose ps

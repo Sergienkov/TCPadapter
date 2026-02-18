@@ -124,7 +124,7 @@ func serveConn(done <-chan struct{}, conn net.Conn, imei string, statusInterval 
 			if !ok {
 				continue
 			}
-			if cmdID == 24 {
+			if cmdID == protocol.CmdControllerAck || cmdID == protocol.CmdRegistrationAck {
 				continue
 			}
 			if rand.Float64() < cfg.ackDropRate {

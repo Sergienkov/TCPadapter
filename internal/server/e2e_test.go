@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -23,8 +24,9 @@ import (
 )
 
 type captureBus struct {
-	mu   sync.Mutex
-	acks []kafka.AckEvent
+	mu        sync.Mutex
+	acks      []kafka.AckEvent
+	telemetry []kafka.TelemetryEvent
 }
 
 func (b *captureBus) PublishAck(_ context.Context, e kafka.AckEvent) {
@@ -33,13 +35,25 @@ func (b *captureBus) PublishAck(_ context.Context, e kafka.AckEvent) {
 	b.acks = append(b.acks, e)
 }
 
-func (b *captureBus) PublishTelemetry(_ context.Context, _ kafka.TelemetryEvent) {}
+func (b *captureBus) PublishTelemetry(_ context.Context, e kafka.TelemetryEvent) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.telemetry = append(b.telemetry, e)
+}
 
 func (b *captureBus) snapshot() []kafka.AckEvent {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	out := make([]kafka.AckEvent, len(b.acks))
 	copy(out, b.acks)
+	return out
+}
+
+func (b *captureBus) snapshotTelemetry() []kafka.TelemetryEvent {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make([]kafka.TelemetryEvent, len(b.telemetry))
+	copy(out, b.telemetry)
 	return out
 }
 
@@ -158,6 +172,70 @@ func TestE2EExpireWhenNoAck(t *testing.T) {
 	}
 
 	waitForAckStatus(t, bus, "e2e-msg-expire", "expired", 5*time.Second)
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("server run error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not stop in time")
+	}
+}
+
+func TestE2ETelemetryTraceIDGenerated(t *testing.T) {
+	listenAddr := freeTCPAddr(t)
+	metricsAddr := freeTCPAddr(t)
+
+	cfg := config.Config{
+		ListenAddr:         listenAddr,
+		MetricsAddr:        metricsAddr,
+		RegistrationWindow: 2 * time.Second,
+		HeartbeatTimeout:   30 * time.Second,
+		MaxConnections:     100,
+		MaxQueueDepth:      100,
+		MaxQueueBytes:      1 << 20,
+		QueueOverflow:      "drop_oldest",
+		AckTimeout:         150 * time.Millisecond,
+		RetryBackoff:       50 * time.Millisecond,
+		MaxRetries:         2,
+		SweepInterval:      40 * time.Millisecond,
+		WriteTimeout:       1 * time.Second,
+		ReadTimeout:        5 * time.Second,
+		DebugLogs:          false,
+		StateFile:          "",
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	sessions := session.NewManager(cfg.MaxConnections, cfg.MaxQueueDepth, cfg.MaxQueueBytes, cfg.QueueOverflow, store.NewInMemoryStore())
+	bus := &captureBus{}
+	srv := New(cfg, logger, sessions, bus)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- srv.Run(ctx)
+	}()
+	waitTCPReady(t, listenAddr, 3*time.Second)
+
+	conn, err := net.DialTimeout("tcp", listenAddr, 500*time.Millisecond)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	controllerID := "860000000000009"
+	if err := writeFrame(conn, buildRegistrationPayload(controllerID)); err != nil {
+		t.Fatalf("write registration failed: %v", err)
+	}
+	if err := writeFrame(conn, buildStatus1Payload(1400)); err != nil {
+		t.Fatalf("write status1 failed: %v", err)
+	}
+
+	waitForTelemetryTracePrefix(t, bus, controllerID, 2, "rx-"+controllerID+"-", 3*time.Second)
 
 	cancel()
 	select {
@@ -386,6 +464,146 @@ func TestE2EAckInProgressThenDelivered(t *testing.T) {
 	}
 }
 
+func TestE2ERegistrationAckSent(t *testing.T) {
+	listenAddr := freeTCPAddr(t)
+	metricsAddr := freeTCPAddr(t)
+
+	cfg := config.Config{
+		ListenAddr:         listenAddr,
+		MetricsAddr:        metricsAddr,
+		RegistrationWindow: 2 * time.Second,
+		HeartbeatTimeout:   30 * time.Second,
+		MaxConnections:     100,
+		MaxQueueDepth:      100,
+		MaxQueueBytes:      1 << 20,
+		QueueOverflow:      "drop_oldest",
+		AckTimeout:         150 * time.Millisecond,
+		RetryBackoff:       50 * time.Millisecond,
+		MaxRetries:         2,
+		SweepInterval:      40 * time.Millisecond,
+		WriteTimeout:       1 * time.Second,
+		ReadTimeout:        5 * time.Second,
+		DebugLogs:          false,
+		StateFile:          "",
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	sessions := session.NewManager(cfg.MaxConnections, cfg.MaxQueueDepth, cfg.MaxQueueBytes, cfg.QueueOverflow, store.NewInMemoryStore())
+	srv := New(cfg, logger, sessions, &captureBus{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.Run(ctx) }()
+	waitTCPReady(t, listenAddr, 3*time.Second)
+
+	conn, err := net.DialTimeout("tcp", listenAddr, 500*time.Millisecond)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	if err := writeFrame(conn, buildRegistrationPayload("860000000000321")); err != nil {
+		t.Fatalf("registration write failed: %v", err)
+	}
+
+	r := bufio.NewReader(conn)
+	_ = conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+	frame, err := protocol.ReadFrame(r)
+	if err != nil {
+		t.Fatalf("read registration ack failed: %v", err)
+	}
+	if cmdID, ok := frame.CommandID(); !ok || cmdID != protocol.CmdRegistrationAck {
+		t.Fatalf("expected cmd=1 registration ack, got ok=%v cmd=%d", ok, cmdID)
+	}
+	if len(frame.Payload) < 2 {
+		t.Fatalf("unexpected registration ack payload len: %d", len(frame.Payload))
+	}
+	if frame.Payload[1] != protocol.AckCodeOK {
+		t.Fatalf("expected registration ack code=0, got %d", frame.Payload[1])
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("server run error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not stop in time")
+	}
+}
+
+func TestE2EHeartbeatTimeoutDisconnectsWithoutStatus1(t *testing.T) {
+	listenAddr := freeTCPAddr(t)
+	metricsAddr := freeTCPAddr(t)
+
+	cfg := config.Config{
+		ListenAddr:         listenAddr,
+		MetricsAddr:        metricsAddr,
+		RegistrationWindow: 2 * time.Second,
+		HeartbeatTimeout:   250 * time.Millisecond,
+		MaxConnections:     100,
+		MaxQueueDepth:      100,
+		MaxQueueBytes:      1 << 20,
+		QueueOverflow:      "drop_oldest",
+		AckTimeout:         150 * time.Millisecond,
+		RetryBackoff:       50 * time.Millisecond,
+		MaxRetries:         2,
+		SweepInterval:      40 * time.Millisecond,
+		WriteTimeout:       1 * time.Second,
+		ReadTimeout:        5 * time.Second,
+		DebugLogs:          false,
+		StateFile:          "",
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	sessions := session.NewManager(cfg.MaxConnections, cfg.MaxQueueDepth, cfg.MaxQueueBytes, cfg.QueueOverflow, store.NewInMemoryStore())
+	srv := New(cfg, logger, sessions, &captureBus{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.Run(ctx) }()
+	waitTCPReady(t, listenAddr, 3*time.Second)
+
+	conn, err := net.DialTimeout("tcp", listenAddr, 500*time.Millisecond)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+	r := bufio.NewReader(conn)
+
+	if err := writeFrame(conn, buildRegistrationPayload("860000000000322")); err != nil {
+		t.Fatalf("registration write failed: %v", err)
+	}
+
+	_ = conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+	if _, err := protocol.ReadFrame(r); err != nil {
+		t.Fatalf("read registration ack failed: %v", err)
+	}
+
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, err = conn.Read(make([]byte, 1))
+	if err == nil {
+		t.Fatal("expected connection to be closed by heartbeat timeout")
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		t.Fatalf("connection still open after heartbeat timeout: %v", err)
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("server run error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not stop in time")
+	}
+}
+
 func runControllerDropFirstAck(t *testing.T, ctx context.Context, addr, imei string) {
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -423,7 +641,7 @@ func runControllerDropFirstAck(t *testing.T, ctx context.Context, addr, imei str
 		if !ok {
 			continue
 		}
-		if cmdID == 24 {
+		if cmdID == protocol.CmdControllerAck || cmdID == protocol.CmdRegistrationAck {
 			continue
 		}
 		if !dropped {
@@ -511,7 +729,7 @@ func runControllerAckAll(t *testing.T, ctx context.Context, addr, imei string) {
 				return
 			}
 			cmdID, ok := frame.CommandID()
-			if !ok || cmdID == 24 {
+			if !ok || cmdID == protocol.CmdControllerAck || cmdID == protocol.CmdRegistrationAck {
 				continue
 			}
 			_ = writeFrame(conn, buildAck11Payload(frame.Seq, 0, 1500))
@@ -553,7 +771,7 @@ func runControllerAckInProgressThenDone(t *testing.T, ctx context.Context, addr,
 			return
 		}
 		cmdID, ok := frame.CommandID()
-		if !ok || cmdID == 24 {
+		if !ok || cmdID == protocol.CmdControllerAck || cmdID == protocol.CmdRegistrationAck {
 			continue
 		}
 
@@ -579,6 +797,21 @@ func waitForAckStatus(t *testing.T, bus *captureBus, messageID, status string, t
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("timeout waiting ack status=%s for message=%s; got=%+v", status, messageID, bus.snapshot())
+}
+
+func waitForTelemetryTracePrefix(t *testing.T, bus *captureBus, controllerID string, commandID uint8, prefix string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		items := bus.snapshotTelemetry()
+		for _, e := range items {
+			if e.ControllerID == controllerID && e.CommandID == commandID && strings.HasPrefix(e.TraceID, prefix) {
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timeout waiting telemetry trace prefix=%s for controller=%s cmd=%d; got=%+v", prefix, controllerID, commandID, bus.snapshotTelemetry())
 }
 
 func freeTCPAddr(t *testing.T) string {

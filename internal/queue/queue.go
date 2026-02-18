@@ -16,6 +16,7 @@ const (
 
 type Command struct {
 	MessageID string
+	TraceID   string
 	DedupKey  string
 	CommandID uint8
 	TTL       time.Duration
@@ -23,6 +24,7 @@ type Command struct {
 	Payload   []byte
 	Priority  Priority
 	Attempts  int
+	RetrySeq  uint8
 }
 
 func EstimatedCommandBytes(cmd Command) int {

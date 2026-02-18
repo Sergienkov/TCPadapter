@@ -1,0 +1,13 @@
+# Build outputs
+/tcpadapter
+/controller-sim
+
+# Local runtime state
+/.data/
+
+# Stress and local test artifacts
+/artifacts/
+*.log
+
+# OS/editor noise
+.DS_Store

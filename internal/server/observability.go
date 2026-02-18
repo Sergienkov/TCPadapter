@@ -16,42 +16,101 @@ import (
 	"tcpadapter/internal/queue"
 )
 
-func (s *Server) startObservability(ctx context.Context) {
+var ackLatencyBoundsSeconds = []float64{0.1, 0.5, 1, 2, 5, 10, 30, 60}
+
+func (s *Server) startObservability() *http.Server {
 	if s.cfg.MetricsAddr == "" {
-		return
+		return nil
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok\n"))
-	})
-	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok\n"))
-	})
+	mux.HandleFunc("/healthz", s.healthzHandler)
+	mux.HandleFunc("/readyz", s.readyzHandler)
 	mux.HandleFunc("/metrics", s.metricsHandler)
 	mux.HandleFunc("/debug/queues", s.debugQueuesHandler)
 	mux.HandleFunc("/debug/enqueue", s.debugEnqueueHandler)
 
 	httpSrv := &http.Server{Addr: s.cfg.MetricsAddr, Handler: mux}
 	go func() {
-		<-ctx.Done()
-		_ = httpSrv.Shutdown(context.Background())
-	}()
-	go func() {
 		s.logger.Info("observability server started", "addr", s.cfg.MetricsAddr)
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			s.logger.Error("observability server failed", "error", err)
 		}
 	}()
+	return httpSrv
+}
+
+func (s *Server) healthzHandler(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok\n"))
+}
+
+func (s *Server) readyzHandler(w http.ResponseWriter, _ *http.Request) {
+	if !s.ready.Load() || s.shuttingDown.Load() {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("not ready\n"))
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok\n"))
 }
 
 func (s *Server) publishAck(ctx context.Context, event kafka.AckEvent) {
 	s.ackMu.Lock()
 	s.ackStats[event.Status]++
+	if isTerminalAckStatus(event.Status) {
+		key := fmt.Sprintf("status=%s,reason=%s", event.Status, normalizeReasonLabel(event.Reason))
+		s.ackTerminalReasonStats[key]++
+	}
 	s.ackMu.Unlock()
 	s.bus.PublishAck(ctx, event)
+}
+
+func (s *Server) publishTelemetry(ctx context.Context, event kafka.TelemetryEvent, traceSource string) {
+	if traceSource == "" {
+		traceSource = "rx"
+	}
+	key := fmt.Sprintf("command_id=%d,trace_source=%s", event.CommandID, traceSource)
+	s.telemetryMu.Lock()
+	s.telemetryStats[key]++
+	s.telemetryMu.Unlock()
+	s.bus.PublishTelemetry(ctx, event)
+}
+
+func (s *Server) publishAckWithCommand(ctx context.Context, event kafka.AckEvent, cmd queue.Command) {
+	s.observeAckLatency(event.Status, cmd)
+	s.publishAck(ctx, event)
+}
+
+func (s *Server) observeAckLatency(status string, cmd queue.Command) {
+	if !isTerminalAckStatus(status) || cmd.CreatedAt.IsZero() {
+		return
+	}
+	latencySeconds := time.Since(cmd.CreatedAt).Seconds()
+	if latencySeconds < 0 {
+		return
+	}
+
+	s.ackMu.Lock()
+	defer s.ackMu.Unlock()
+
+	s.ackLatencyCount++
+	s.ackLatencySumSeconds += latencySeconds
+	for i, bound := range ackLatencyBoundsSeconds {
+		if latencySeconds <= bound {
+			s.ackLatencyBucketCounts[i]++
+			return
+		}
+	}
+}
+
+func isTerminalAckStatus(status string) bool {
+	switch status {
+	case "delivered", "failed", "expired", "unsupported", "duplicate":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Server) metricsHandler(w http.ResponseWriter, _ *http.Request) {
@@ -104,7 +163,48 @@ func (s *Server) metricsHandler(w http.ResponseWriter, _ *http.Request) {
 	for _, k := range keys {
 		b.WriteString(fmt.Sprintf("tcpadapter_ack_total{status=%q} %d\n", k, s.ackStats[k]))
 	}
+	b.WriteString("# HELP tcpadapter_ack_terminal_total Terminal ACK outcomes by status and normalized reason\n")
+	b.WriteString("# TYPE tcpadapter_ack_terminal_total counter\n")
+	rkeys := make([]string, 0, len(s.ackTerminalReasonStats))
+	for k := range s.ackTerminalReasonStats {
+		rkeys = append(rkeys, k)
+	}
+	sort.Strings(rkeys)
+	for _, k := range rkeys {
+		labels := parseAckTerminalReasonKey(k)
+		b.WriteString(fmt.Sprintf(
+			"tcpadapter_ack_terminal_total{status=%q,reason=%q} %d\n",
+			labels["status"], labels["reason"], s.ackTerminalReasonStats[k],
+		))
+	}
+	b.WriteString("# HELP tcpadapter_ack_latency_seconds End-to-end latency from command enqueue to terminal ack\n")
+	b.WriteString("# TYPE tcpadapter_ack_latency_seconds histogram\n")
+	cumulative := uint64(0)
+	for i, le := range ackLatencyBoundsSeconds {
+		cumulative += s.ackLatencyBucketCounts[i]
+		b.WriteString(fmt.Sprintf("tcpadapter_ack_latency_seconds_bucket{le=%q} %d\n", strconv.FormatFloat(le, 'f', -1, 64), cumulative))
+	}
+	b.WriteString(fmt.Sprintf("tcpadapter_ack_latency_seconds_bucket{le=\"+Inf\"} %d\n", s.ackLatencyCount))
+	b.WriteString(fmt.Sprintf("tcpadapter_ack_latency_seconds_sum %g\n", s.ackLatencySumSeconds))
+	b.WriteString(fmt.Sprintf("tcpadapter_ack_latency_seconds_count %d\n", s.ackLatencyCount))
 	s.ackMu.Unlock()
+
+	b.WriteString("# HELP tcpadapter_telemetry_total Incoming telemetry frames by command and trace source\n")
+	b.WriteString("# TYPE tcpadapter_telemetry_total counter\n")
+	s.telemetryMu.Lock()
+	tkeys := make([]string, 0, len(s.telemetryStats))
+	for k := range s.telemetryStats {
+		tkeys = append(tkeys, k)
+	}
+	sort.Strings(tkeys)
+	for _, k := range tkeys {
+		labels := parseTelemetryKey(k)
+		b.WriteString(fmt.Sprintf(
+			"tcpadapter_telemetry_total{command_id=%q,trace_source=%q} %d\n",
+			labels["command_id"], labels["trace_source"], s.telemetryStats[k],
+		))
+	}
+	s.telemetryMu.Unlock()
 
 	b.WriteString("# HELP tcpadapter_queue_overflow_total Queue overflow events by limit and policy\n")
 	b.WriteString("# TYPE tcpadapter_queue_overflow_total counter\n")
@@ -123,6 +223,35 @@ func (s *Server) metricsHandler(w http.ResponseWriter, _ *http.Request) {
 	}
 	s.ovfMu.Unlock()
 
+	b.WriteString("# HELP tcpadapter_ip_violations_total Protocol violations tracked per source IP\n")
+	b.WriteString("# TYPE tcpadapter_ip_violations_total counter\n")
+	b.WriteString(fmt.Sprintf("tcpadapter_ip_violations_total %d\n", s.ipViolationTotal.Load()))
+
+	b.WriteString("# HELP tcpadapter_ip_rejected_total Rejected connections by IP protection reason\n")
+	b.WriteString("# TYPE tcpadapter_ip_rejected_total counter\n")
+	b.WriteString(fmt.Sprintf("tcpadapter_ip_rejected_total{reason=%q} %d\n", "per_ip_limit", s.ipPerIPRejectTotal.Load()))
+	b.WriteString(fmt.Sprintf("tcpadapter_ip_rejected_total{reason=%q} %d\n", "blocked", s.ipBlockedRejectTotal.Load()))
+
+	b.WriteString("# HELP tcpadapter_ip_blocks_applied_total Temporary IP blocks applied after violations\n")
+	b.WriteString("# TYPE tcpadapter_ip_blocks_applied_total counter\n")
+	b.WriteString(fmt.Sprintf("tcpadapter_ip_blocks_applied_total %d\n", s.ipBlockAppliedTotal.Load()))
+
+	b.WriteString("# HELP tcpadapter_shutdown_drain_seconds Time spent draining connections during shutdown\n")
+	b.WriteString("# TYPE tcpadapter_shutdown_drain_seconds summary\n")
+	s.shutdownMu.Lock()
+	b.WriteString(fmt.Sprintf("tcpadapter_shutdown_drain_seconds_sum %g\n", s.shutdownDrainSumSecs))
+	b.WriteString(fmt.Sprintf("tcpadapter_shutdown_drain_seconds_count %d\n", s.shutdownDrainCount))
+	s.shutdownMu.Unlock()
+
+	b.WriteString("# HELP tcpadapter_shutdown_drain_last_seconds Last observed shutdown drain duration\n")
+	b.WriteString("# TYPE tcpadapter_shutdown_drain_last_seconds gauge\n")
+	s.shutdownMu.Lock()
+	b.WriteString(fmt.Sprintf("tcpadapter_shutdown_drain_last_seconds %g\n", s.shutdownDrainLastSecs))
+	b.WriteString("# HELP tcpadapter_shutdown_drain_timeouts_total Number of shutdown drains that hit timeout\n")
+	b.WriteString("# TYPE tcpadapter_shutdown_drain_timeouts_total counter\n")
+	b.WriteString(fmt.Sprintf("tcpadapter_shutdown_drain_timeouts_total %d\n", s.shutdownDrainTimeouts))
+	s.shutdownMu.Unlock()
+
 	_, _ = w.Write([]byte(b.String()))
 }
 
@@ -137,6 +266,57 @@ func parseOverflowKey(key string) map[string]string {
 		out[kv[0]] = kv[1]
 	}
 	return out
+}
+
+func parseAckTerminalReasonKey(key string) map[string]string {
+	out := map[string]string{"status": "", "reason": ""}
+	parts := strings.Split(key, ",")
+	for _, p := range parts {
+		kv := strings.SplitN(p, "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		out[kv[0]] = kv[1]
+	}
+	return out
+}
+
+func parseTelemetryKey(key string) map[string]string {
+	out := map[string]string{"command_id": "", "trace_source": ""}
+	parts := strings.Split(key, ",")
+	for _, p := range parts {
+		kv := strings.SplitN(p, "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		out[kv[0]] = kv[1]
+	}
+	return out
+}
+
+func normalizeReasonLabel(reason string) string {
+	r := strings.TrimSpace(reason)
+	if r == "" {
+		return "unspecified"
+	}
+	if i := strings.Index(r, ";"); i > 0 {
+		r = strings.TrimSpace(r[:i])
+	}
+	if i := strings.Index(r, ":"); i > 0 {
+		prefix := strings.TrimSpace(r[:i])
+		if prefix != "" {
+			r = prefix
+		}
+	}
+	r = strings.ToLower(r)
+	r = strings.ReplaceAll(r, " ", "_")
+	if len(r) > 48 {
+		r = r[:48]
+	}
+	if r == "" {
+		return "unspecified"
+	}
+	return r
 }
 
 func (s *Server) debugQueuesHandler(w http.ResponseWriter, r *http.Request) {
@@ -169,6 +349,7 @@ type debugEnqueueRequest struct {
 	TTLSeconds   int    `json:"ttl_seconds"`
 	PayloadHex   string `json:"payload_hex"`
 	MessageID    string `json:"message_id"`
+	TraceID      string `json:"trace_id"`
 	DedupKey     string `json:"dedup_key"`
 }
 
@@ -220,9 +401,17 @@ func (s *Server) debugEnqueueHandler(w http.ResponseWriter, r *http.Request) {
 	if messageID == "" {
 		messageID = fmt.Sprintf("debug-%d", time.Now().UnixNano())
 	}
+	traceID := strings.TrimSpace(req.TraceID)
+	if traceID == "" {
+		traceID = strings.TrimSpace(r.Header.Get("X-Request-ID"))
+	}
+	if traceID == "" {
+		traceID = fmt.Sprintf("trace-%d", time.Now().UnixNano())
+	}
 
 	cmd := queue.Command{
 		MessageID: messageID,
+		TraceID:   traceID,
 		DedupKey:  strings.TrimSpace(req.DedupKey),
 		CommandID: req.CommandID,
 		TTL:       ttl,
@@ -241,5 +430,6 @@ func (s *Server) debugEnqueueHandler(w http.ResponseWriter, r *http.Request) {
 		"controller_id": req.ControllerID,
 		"command_id":    req.CommandID,
 		"message_id":    messageID,
+		"trace_id":      traceID,
 	})
 }

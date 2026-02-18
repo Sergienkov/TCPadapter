@@ -20,16 +20,17 @@ var (
 )
 
 type Session struct {
-	ControllerID string
-	Conn         net.Conn
-	Queue        *queue.ControllerQueue
-	LastSeen     time.Time
-	BufferFree   int
-	FWMode       bool
-	SyncMode     bool
-	Dedup        map[string]time.Time
-	InFlight     map[uint8]InFlightEntry
-	NextSeq      uint8
+	ControllerID           string
+	Conn                   net.Conn
+	Queue                  *queue.ControllerQueue
+	LastSeen               time.Time
+	lastTouchedPersistedAt time.Time
+	BufferFree             int
+	FWMode                 bool
+	SyncMode               bool
+	Dedup                  map[string]time.Time
+	InFlight               map[uint8]InFlightEntry
+	NextSeq                uint8
 }
 
 type DeliveryContext struct {
@@ -57,6 +58,14 @@ type InFlightOutcome struct {
 	Reason     string
 }
 
+type DeliveryPolicy struct {
+	AckTimeout   time.Duration
+	RetryBackoff time.Duration
+	MaxRetries   int
+}
+
+type DeliveryPolicyResolver func(controllerID string, cmd queue.Command) DeliveryPolicy
+
 type Manager struct {
 	mu             sync.RWMutex
 	sessions       map[string]*Session
@@ -66,6 +75,8 @@ type Manager struct {
 	overflowPolicy string
 	store          store.Store
 }
+
+const touchPersistInterval = 5 * time.Second
 
 type OverflowEvent struct {
 	ControllerID string
@@ -129,14 +140,15 @@ func (m *Manager) Create(controllerID string, conn net.Conn) (*Session, error) {
 	}
 	now := time.Now().UTC()
 	s := &Session{
-		ControllerID: controllerID,
-		Conn:         conn,
-		Queue:        queue.NewControllerQueue(),
-		LastSeen:     now,
-		BufferFree:   1500,
-		Dedup:        make(map[string]time.Time),
-		InFlight:     make(map[uint8]InFlightEntry),
-		NextSeq:      0,
+		ControllerID:           controllerID,
+		Conn:                   conn,
+		Queue:                  queue.NewControllerQueue(),
+		LastSeen:               now,
+		lastTouchedPersistedAt: now,
+		BufferFree:             1500,
+		Dedup:                  make(map[string]time.Time),
+		InFlight:               make(map[uint8]InFlightEntry),
+		NextSeq:                0,
 	}
 	m.sessions[controllerID] = s
 	_ = m.persistLocked(s)
@@ -173,6 +185,10 @@ func (m *Manager) Touch(controllerID string) {
 	if s, ok := m.sessions[controllerID]; ok {
 		now := time.Now().UTC()
 		s.LastSeen = now
+		if now.Sub(s.lastTouchedPersistedAt) < touchPersistInterval {
+			return
+		}
+		s.lastTouchedPersistedAt = now
 		_ = m.persistLocked(s)
 	}
 }
@@ -291,14 +307,15 @@ func (m *Manager) enqueueLocked(controllerID string, cmd queue.Command, events *
 func (m *Manager) createDetachedLocked(controllerID string) *Session {
 	now := time.Now().UTC()
 	s := &Session{
-		ControllerID: controllerID,
-		Conn:         nil,
-		Queue:        queue.NewControllerQueue(),
-		LastSeen:     now,
-		BufferFree:   1500,
-		Dedup:        make(map[string]time.Time),
-		InFlight:     make(map[uint8]InFlightEntry),
-		NextSeq:      0,
+		ControllerID:           controllerID,
+		Conn:                   nil,
+		Queue:                  queue.NewControllerQueue(),
+		LastSeen:               now,
+		lastTouchedPersistedAt: now,
+		BufferFree:             1500,
+		Dedup:                  make(map[string]time.Time),
+		InFlight:               make(map[uint8]InFlightEntry),
+		NextSeq:                0,
 	}
 	m.sessions[controllerID] = s
 	_ = m.persistLocked(s)
@@ -310,7 +327,6 @@ func (m *Manager) UpdateBufferFree(controllerID string, free int) {
 	defer m.mu.Unlock()
 	if s, ok := m.sessions[controllerID]; ok {
 		s.BufferFree = free
-		_ = m.persistLocked(s)
 	}
 }
 
@@ -382,16 +398,17 @@ func (m *Manager) Restore() (int, error) {
 			}
 		}
 		m.sessions[snap.ControllerID] = &Session{
-			ControllerID: snap.ControllerID,
-			Conn:         nil,
-			Queue:        q,
-			LastSeen:     snap.LastSeen,
-			BufferFree:   snap.BufferFree,
-			FWMode:       snap.FWMode,
-			SyncMode:     snap.SyncMode,
-			Dedup:        make(map[string]time.Time),
-			InFlight:     inFlight,
-			NextSeq:      snap.NextSeq,
+			ControllerID:           snap.ControllerID,
+			Conn:                   nil,
+			Queue:                  q,
+			LastSeen:               snap.LastSeen,
+			lastTouchedPersistedAt: snap.LastSeen,
+			BufferFree:             snap.BufferFree,
+			FWMode:                 snap.FWMode,
+			SyncMode:               snap.SyncMode,
+			Dedup:                  make(map[string]time.Time),
+			InFlight:               inFlight,
+			NextSeq:                snap.NextSeq,
 		}
 		if m.sessions[snap.ControllerID].BufferFree <= 0 {
 			m.sessions[snap.ControllerID].BufferFree = 1500
@@ -455,6 +472,31 @@ func (m *Manager) ControllerIDs() []string {
 		out = append(out, id)
 	}
 	return out
+}
+
+func (m *Manager) InFlightSeqs(controllerID string) []uint8 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	s, ok := m.sessions[controllerID]
+	if !ok || len(s.InFlight) == 0 {
+		return nil
+	}
+	out := make([]uint8, 0, len(s.InFlight))
+	for seq := range s.InFlight {
+		out = append(out, seq)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+func (m *Manager) InFlightCount(controllerID string) int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	s, ok := m.sessions[controllerID]
+	if !ok {
+		return 0
+	}
+	return len(s.InFlight)
 }
 
 func (m *Manager) SessionCount() int {
@@ -563,6 +605,27 @@ func (m *Manager) AckInFlight(controllerID string, seq uint8) (queue.Command, in
 	return entry.Command, entry.Attempts, true
 }
 
+// AckSingleInFlightFallback acknowledges the only in-flight command for a controller.
+// It is intended as a defensive fallback for protocol variants where ACK command sequence
+// may be encoded inconsistently while only one command can be outstanding.
+func (m *Manager) AckSingleInFlightFallback(controllerID string) (uint8, queue.Command, int, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.sessions[controllerID]
+	if !ok {
+		return 0, queue.Command{}, 0, false
+	}
+	if len(s.InFlight) != 1 {
+		return 0, queue.Command{}, 0, false
+	}
+	for seq, entry := range s.InFlight {
+		delete(s.InFlight, seq)
+		_ = m.persistLocked(s)
+		return seq, entry.Command, entry.Attempts, true
+	}
+	return 0, queue.Command{}, 0, false
+}
+
 func (m *Manager) PeekInFlight(controllerID string, seq uint8) (queue.Command, int, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -577,7 +640,7 @@ func (m *Manager) PeekInFlight(controllerID string, seq uint8) (queue.Command, i
 	return entry.Command, entry.Attempts, true
 }
 
-func (m *Manager) ProcessInFlight(controllerID string, now time.Time, ackTimeout, retryBackoff time.Duration, maxRetries int) ([]InFlightOutcome, error) {
+func (m *Manager) ProcessInFlight(controllerID string, now time.Time, resolver DeliveryPolicyResolver) ([]InFlightOutcome, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -588,7 +651,25 @@ func (m *Manager) ProcessInFlight(controllerID string, now time.Time, ackTimeout
 
 	out := make([]InFlightOutcome, 0)
 	for seq, entry := range s.InFlight {
-		wait := ackTimeout + time.Duration(entry.Attempts-1)*retryBackoff
+		policy := DeliveryPolicy{
+			AckTimeout:   10 * time.Second,
+			RetryBackoff: 0,
+			MaxRetries:   3,
+		}
+		if resolver != nil {
+			policy = resolver(controllerID, entry.Command)
+		}
+		if policy.AckTimeout <= 0 {
+			policy.AckTimeout = 10 * time.Second
+		}
+		if policy.MaxRetries < 0 {
+			policy.MaxRetries = 0
+		}
+
+		ackTimeout := policy.AckTimeout
+		retryBackoff := policy.RetryBackoff
+		maxRetries := policy.MaxRetries
+		wait := ackTimeout + retryDelay(entry.Attempts, retryBackoff, jitterSeedForEntry(entry))
 		if wait < 0 {
 			wait = ackTimeout
 		}
@@ -610,6 +691,11 @@ func (m *Manager) ProcessInFlight(controllerID string, now time.Time, ackTimeout
 		}
 
 		if entry.Attempts >= maxRetries+1 {
+			// Allow a short grace window for late terminal ACKs before final fail.
+			if now.Before(entry.SentAt.Add(wait + lateAckGrace)) {
+				s.InFlight[seq] = entry
+				continue
+			}
 			out = append(out, InFlightOutcome{
 				Type:     "failed",
 				Seq:      seq,
@@ -621,6 +707,7 @@ func (m *Manager) ProcessInFlight(controllerID string, now time.Time, ackTimeout
 		}
 
 		cmd.Attempts = entry.Attempts
+		cmd.RetrySeq = seq
 		s.Queue.Push(cmd)
 		out = append(out, InFlightOutcome{
 			Type:     "retrying",
@@ -633,4 +720,63 @@ func (m *Manager) ProcessInFlight(controllerID string, now time.Time, ackTimeout
 
 	_ = m.persistLocked(s)
 	return out, nil
+}
+
+const (
+	maxRetryBackoffShift = 6 // cap at 64x of base
+	jitterPercent        = 20
+	lateAckGrace         = 2 * time.Second
+)
+
+func retryDelay(attempts int, base time.Duration, seed uint64) time.Duration {
+	if attempts <= 1 || base <= 0 {
+		return 0
+	}
+
+	shift := attempts - 2
+	if shift < 0 {
+		shift = 0
+	}
+	if shift > maxRetryBackoffShift {
+		shift = maxRetryBackoffShift
+	}
+
+	// Exponential backoff from attempt #2 and onward.
+	delay := base * time.Duration(1<<shift)
+	if delay < 0 {
+		return base
+	}
+
+	// Deterministic jitter (+/-20%) keeps tests stable and reduces thundering herd.
+	jitterRange := delay * jitterPercent / 100
+	if jitterRange <= 0 {
+		return delay
+	}
+
+	span := int64(jitterRange)*2 + 1
+	if span <= 0 {
+		return delay
+	}
+
+	v := int64(xorshift64(seed)%uint64(span)) - int64(jitterRange)
+	out := delay + time.Duration(v)
+	if out < 0 {
+		return 0
+	}
+	return out
+}
+
+func jitterSeedForEntry(entry InFlightEntry) uint64 {
+	// Stable per in-flight command attempt.
+	return (uint64(entry.Seq) << 32) | (uint64(entry.Attempts&0xffff) << 16) | uint64(entry.Command.CommandID)
+}
+
+func xorshift64(x uint64) uint64 {
+	if x == 0 {
+		x = 0x9e3779b97f4a7c15
+	}
+	x ^= x << 13
+	x ^= x >> 7
+	x ^= x << 17
+	return x
 }

@@ -1,0 +1,75 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: tcpadapter-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: tcpadapter
+      POSTGRES_USER: tcpadapter
+      POSTGRES_PASSWORD: tcpadapter
+    ports:
+      - "5432:5432"
+    volumes:
+      - tcpadapter_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tcpadapter -d tcpadapter"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  adapter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tcpadapter:local
+    container_name: tcpadapter
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "15010:15010"
+      - "18080:18080"
+    environment:
+      TCPADAPTER_LISTEN_ADDR: ":15010"
+      TCPADAPTER_METRICS_ADDR: ":18080"
+      TCPADAPTER_STORE_BACKEND: "postgres"
+      TCPADAPTER_POSTGRES_DSN: "postgres://tcpadapter:tcpadapter@postgres:5432/tcpadapter?sslmode=disable"
+      TCPADAPTER_DEBUG: "false"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:18080/readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  controller-sim:
+    image: tcpadapter:local
+    container_name: tcpadapter-sim
+    profiles: ["sim"]
+    depends_on:
+      adapter:
+        condition: service_healthy
+    command:
+      - /usr/local/bin/controller-sim
+      - --addr
+      - adapter:15010
+      - --clients
+      - ${SIM_CLIENTS:-50}
+      - --status-interval
+      - ${SIM_STATUS_INTERVAL:-2s}
+      - --ack-delay
+      - ${SIM_ACK_DELAY:-250ms}
+      - --ack-error-rate
+      - ${SIM_ACK_ERROR_RATE:-0.10}
+      - --ack-drop-rate
+      - ${SIM_ACK_DROP_RATE:-0.05}
+      - --status-burst-size
+      - ${SIM_STATUS_BURST_SIZE:-4}
+      - --status-burst-spacing
+      - ${SIM_STATUS_BURST_SPACING:-20ms}
+    restart: unless-stopped
+
+volumes:
+  tcpadapter_pg:

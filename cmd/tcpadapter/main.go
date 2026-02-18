@@ -26,20 +26,44 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	var sessionStore store.Store = store.NewInMemoryStore()
-	sessions := session.NewManager(cfg.MaxConnections, cfg.MaxQueueDepth, cfg.MaxQueueBytes, cfg.QueueOverflow, sessionStore)
+	var (
+		sessionStore store.Store
+		storeLabel   string
+	)
 	bus := kafka.NewLoggingBus(logger)
 
-	if cfg.StateFile != "" {
+	switch cfg.StoreBackend {
+	case "memory":
+		sessionStore = store.NewInMemoryStore()
+		storeLabel = "memory"
+	case "file":
 		sessionStore = store.NewFileStore(cfg.StateFile)
-		sessions = session.NewManager(cfg.MaxConnections, cfg.MaxQueueDepth, cfg.MaxQueueBytes, cfg.QueueOverflow, sessionStore)
+		storeLabel = cfg.StateFile
+	case "postgres":
+		pgStore, err := store.NewPostgresStore(cfg.PostgresDSN)
+		if err != nil {
+			logger.Error("failed to initialize postgres store", "error", err)
+			os.Exit(1)
+		}
+		defer func() {
+			if err := pgStore.Close(); err != nil {
+				logger.Warn("failed to close postgres store", "error", err)
+			}
+		}()
+		sessionStore = pgStore
+		storeLabel = "postgres"
+	default:
+		logger.Error("unsupported store backend", "backend", cfg.StoreBackend)
+		os.Exit(1)
 	}
+	sessions := session.NewManager(cfg.MaxConnections, cfg.MaxQueueDepth, cfg.MaxQueueBytes, cfg.QueueOverflow, sessionStore)
+
 	restored, err := sessions.Restore()
 	if err != nil {
 		logger.Error("failed to restore sessions", "error", err)
 		os.Exit(1)
 	}
-	logger.Info("session state restored", "count", restored, "state_file", cfg.StateFile)
+	logger.Info("session state restored", "count", restored, "store_backend", cfg.StoreBackend, "store_target", storeLabel)
 
 	tcpServer := server.New(cfg, logger, sessions, bus)
 	if err := tcpServer.Run(ctx); err != nil {

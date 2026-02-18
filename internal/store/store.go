@@ -2,8 +2,11 @@ package store
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -72,6 +75,8 @@ type FileStore struct {
 	path string
 }
 
+const maxCorruptBackups = 5
+
 func NewFileStore(path string) *FileStore {
 	return &FileStore{path: path}
 }
@@ -128,7 +133,10 @@ func (s *FileStore) readAllLocked() (map[string]SessionSnapshot, error) {
 	}
 	var data map[string]SessionSnapshot
 	if err := json.Unmarshal(raw, &data); err != nil {
-		return nil, err
+		backup := fmt.Sprintf("%s.corrupt-%d", s.path, time.Now().UnixNano())
+		_ = os.Rename(s.path, backup)
+		_ = cleanupCorruptBackups(s.path, maxCorruptBackups)
+		return make(map[string]SessionSnapshot), nil
 	}
 	if data == nil {
 		data = make(map[string]SessionSnapshot)
@@ -137,12 +145,102 @@ func (s *FileStore) readAllLocked() (map[string]SessionSnapshot, error) {
 }
 
 func (s *FileStore) writeAllLocked(data map[string]SessionSnapshot) error {
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
+	dir := filepath.Dir(s.path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
 	raw, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.path, raw, 0o644)
+
+	tmp, err := os.CreateTemp(dir, ".sessions-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if _, err := tmp.Write(raw); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpPath, 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, s.path); err != nil {
+		return fmt.Errorf("rename temp store file: %w", err)
+	}
+	cleanup = false
+
+	// Best effort: fsync directory entry to harden against power loss.
+	_ = syncDir(dir)
+	return nil
+}
+
+func syncDir(dir string) error {
+	f, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
+}
+
+func cleanupCorruptBackups(basePath string, maxKeep int) error {
+	if maxKeep <= 0 {
+		return nil
+	}
+	dir := filepath.Dir(basePath)
+	base := filepath.Base(basePath) + ".corrupt-"
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+
+	type fileEntry struct {
+		name string
+		mod  time.Time
+	}
+	files := make([]fileEntry, 0)
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if !strings.HasPrefix(e.Name(), base) {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		files = append(files, fileEntry{name: e.Name(), mod: info.ModTime()})
+	}
+	if len(files) <= maxKeep {
+		return nil
+	}
+
+	sort.Slice(files, func(i, j int) bool {
+		if files[i].mod.Equal(files[j].mod) {
+			return files[i].name > files[j].name
+		}
+		return files[i].mod.After(files[j].mod)
+	})
+
+	for _, f := range files[maxKeep:] {
+		_ = os.Remove(filepath.Join(dir, f.name))
+	}
+	return nil
 }

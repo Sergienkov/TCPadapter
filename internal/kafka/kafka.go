@@ -7,6 +7,7 @@ import (
 
 type AckEvent struct {
 	MessageID    string
+	TraceID      string
 	ControllerID string
 	CommandID    uint8
 	CommandSeq   uint8
@@ -17,6 +18,7 @@ type AckEvent struct {
 type TelemetryEvent struct {
 	ControllerID string
 	CommandID    uint8
+	TraceID      string
 	Payload      []byte
 }
 
@@ -36,7 +38,8 @@ func NewLoggingBus(logger *slog.Logger) *LoggingBus {
 func (b *LoggingBus) PublishAck(_ context.Context, event AckEvent) {
 	b.logger.Info("ack_event",
 		"message_id", event.MessageID,
-		"controller_id", event.ControllerID,
+		"trace_id", event.TraceID,
+		"controller_id", maskControllerID(event.ControllerID),
 		"command_id", event.CommandID,
 		"command_seq", event.CommandSeq,
 		"status", event.Status,
@@ -46,8 +49,20 @@ func (b *LoggingBus) PublishAck(_ context.Context, event AckEvent) {
 
 func (b *LoggingBus) PublishTelemetry(_ context.Context, event TelemetryEvent) {
 	b.logger.Info("telemetry_event",
-		"controller_id", event.ControllerID,
+		"controller_id", maskControllerID(event.ControllerID),
 		"command_id", event.CommandID,
+		"trace_id", event.TraceID,
 		"payload_len", len(event.Payload),
 	)
+}
+
+func maskControllerID(id string) string {
+	if id == "" {
+		return ""
+	}
+	if len(id) <= 4 {
+		return "****"
+	}
+	n := len(id)
+	return "****" + id[n-4:]
 }
