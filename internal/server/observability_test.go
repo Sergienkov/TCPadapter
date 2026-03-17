@@ -343,6 +343,71 @@ func TestDebugEnqueueHandler_BadPayload(t *testing.T) {
 	}
 }
 
+func TestDebugCommandSchemaHandler(t *testing.T) {
+	cfg := config.Config{DebugLogs: true}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	sessions := session.NewManager(10, 100, 1048576, "drop_oldest", store.NewInMemoryStore())
+	srv := New(cfg, logger, sessions, noopBus{})
+
+	req := httptest.NewRequest("GET", "/debug/command-schema", nil)
+	rr := httptest.NewRecorder()
+	srv.debugCommandSchemaHandler(rr, req)
+	if rr.Code != 200 {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+
+	var payload struct {
+		Items []commandBuilderSpec `json:"items"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("schema json decode error: %v", err)
+	}
+	if len(payload.Items) == 0 {
+		t.Fatal("expected non-empty command schema")
+	}
+	if payload.Items[0].CommandID == 0 {
+		t.Fatalf("unexpected first command: %+v", payload.Items[0])
+	}
+}
+
+func TestDebugBuildCommandHandler(t *testing.T) {
+	cfg := config.Config{DebugLogs: true}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	sessions := session.NewManager(10, 100, 1048576, "drop_oldest", store.NewInMemoryStore())
+	srv := New(cfg, logger, sessions, noopBus{})
+
+	body := `{"command_id":5,"parameters":{"manual_unlock":true,"auto_registration":true}}`
+	req := httptest.NewRequest("POST", "/debug/build-command", strings.NewReader(body))
+	rr := httptest.NewRecorder()
+	srv.debugBuildCommandHandler(rr, req)
+	if rr.Code != 200 {
+		t.Fatalf("expected 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	var resp commandBuildResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("build response decode error: %v", err)
+	}
+	if resp.CommandID != 5 || resp.PayloadLen != 16 || resp.PayloadHex == "" || resp.FrameHex == "" {
+		t.Fatalf("unexpected build response: %+v", resp)
+	}
+}
+
+func TestDebugBuildCommandHandler_BadJSON(t *testing.T) {
+	cfg := config.Config{DebugLogs: true}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	sessions := session.NewManager(10, 100, 1048576, "drop_oldest", store.NewInMemoryStore())
+	srv := New(cfg, logger, sessions, noopBus{})
+
+	body := `{"command_id":16,"parameters":{"timestamp":1,"days_csv":"bad"}}`
+	req := httptest.NewRequest("POST", "/debug/build-command", strings.NewReader(body))
+	rr := httptest.NewRecorder()
+	srv.debugBuildCommandHandler(rr, req)
+	if rr.Code != 400 {
+		t.Fatalf("expected 400, got %d", rr.Code)
+	}
+}
+
 func TestDebugDashboardAndEventsHandlers(t *testing.T) {
 	cfg := config.Config{DebugLogs: true}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))

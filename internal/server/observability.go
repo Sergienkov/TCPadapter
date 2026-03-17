@@ -32,6 +32,9 @@ func (s *Server) startObservability() *http.Server {
 	mux.HandleFunc("/debug/connections", s.debugConnectionsHandler)
 	mux.HandleFunc("/debug/events", s.debugEventsHandler)
 	mux.HandleFunc("/debug/logs", s.debugLogsHandler)
+	mux.HandleFunc("/debug/command-builder", s.debugCommandBuilderHandler)
+	mux.HandleFunc("/debug/command-schema", s.debugCommandSchemaHandler)
+	mux.HandleFunc("/debug/build-command", s.debugBuildCommandHandler)
 	mux.HandleFunc("/debug/queues", s.debugQueuesHandler)
 	mux.HandleFunc("/debug/enqueue", s.debugEnqueueHandler)
 
@@ -877,6 +880,7 @@ func renderDashboardHTML() string {
           <span class="badge"><a href="/debug/connections?limit=100">/debug/connections</a></span>
           <span class="badge"><a href="/debug/events?limit=100">/debug/events</a></span>
           <span class="badge"><a href="/debug/logs">/debug/logs</a></span>
+          <span class="badge"><a href="/debug/command-builder">/debug/command-builder</a></span>
         </div>
       </section>
       <section class="panel hero-side">
