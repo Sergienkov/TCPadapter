@@ -12,7 +12,6 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/tcpadapter
   DEPLOY_PATH: /opt/tcpadapter
 
 jobs:
@@ -22,6 +21,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Compute Image Name
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
       - name: Login To GHCR
         uses: docker/login-action@v3
@@ -37,8 +40,8 @@ jobs:
           file: ./Dockerfile
           push: true
           tags: |
-            ${{ env.IMAGE_NAME }}:${{ github.sha }}
-            ${{ env.IMAGE_NAME }}:main
+            ${{ steps.image.outputs.name }}:${{ github.sha }}
+            ${{ steps.image.outputs.name }}:main
 
       - name: Upload Compose File
         uses: appleboy/scp-action@v0.1.7
@@ -53,7 +56,7 @@ jobs:
       - name: Deploy On Server
         uses: appleboy/ssh-action@v1.2.0
         env:
-          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
           IMAGE_TAG: ${{ github.sha }}
           DEPLOY_PATH: ${{ env.DEPLOY_PATH }}
           GHCR_USERNAME: ${{ secrets.GHCR_USERNAME }}
@@ -72,4 +75,3 @@ jobs:
             docker compose pull adapter
             docker compose up -d adapter
             curl -fsS http://127.0.0.1:18080/readyz
-

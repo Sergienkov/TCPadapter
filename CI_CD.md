@@ -36,6 +36,7 @@ Notes:
 2. `CI` validates tests, binaries, and Docker build.
 3. Merge to `main`.
 4. `Deploy` builds image `ghcr.io/<owner>/tcpadapter:<commit_sha>`.
+   - workflow lowers repository path automatically, so uppercase owner/repo names do not break GHCR tags
 5. Workflow uploads `docker-compose.yml` to `/opt/tcpadapter`.
 6. Workflow connects to the server and runs:
    - `docker login ghcr.io`
@@ -56,4 +57,3 @@ because `docker-compose.yml` keeps the local fallback:
 ```yaml
 image: ${TCPADAPTER_IMAGE:-tcpadapter:local}
 ```
-
