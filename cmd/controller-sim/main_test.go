@@ -3,6 +3,8 @@ package main
 import (
 	"testing"
 	"time"
+
+	"tcpadapter/internal/protocol"
 )
 
 func TestResolveProfileCycle(t *testing.T) {
@@ -54,5 +56,19 @@ func TestControllerStateApplyTriggerPayload(t *testing.T) {
 	}
 	if !st.triggers.NotifyUnknownIDSMS || !st.triggers.ScheduleForAllCalls {
 		t.Fatalf("unexpected trigger state: %+v", st.triggers)
+	}
+}
+
+func TestParseFrameMode(t *testing.T) {
+	mode, err := parseFrameMode("compact")
+	if err != nil || mode != protocol.FrameModeCompact {
+		t.Fatalf("compact parse failed: mode=%v err=%v", mode, err)
+	}
+	mode, err = parseFrameMode("sequenced")
+	if err != nil || mode != protocol.FrameModeSequenced {
+		t.Fatalf("sequenced parse failed: mode=%v err=%v", mode, err)
+	}
+	if _, err := parseFrameMode("broken"); err == nil {
+		t.Fatal("expected invalid mode error")
 	}
 }

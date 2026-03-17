@@ -33,6 +33,7 @@ func main() {
 	burstSpacing := flag.Duration("status-burst-spacing", 50*time.Millisecond, "base spacing between packets inside burst")
 	profile := flag.String("profile", "healthy", "simulator profile: healthy|slow|flaky|bursty|starved")
 	profileMix := flag.String("profile-mix", "", "comma-separated profile cycle for clients, e.g. healthy,flaky,bursty")
+	frameModeName := flag.String("frame-mode", "compact", "frame mode: compact|sequenced")
 	flag.Parse()
 
 	if *clients <= 0 {
@@ -52,6 +53,10 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	frameMode, err := parseFrameMode(*frameModeName)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -68,6 +73,7 @@ func main() {
 		reconnectMin:        500 * time.Millisecond,
 		reconnectMax:        1500 * time.Millisecond,
 		postCommandCoolDown: 250 * time.Millisecond,
+		frameMode:           frameMode,
 	}
 
 	log.Printf(
@@ -105,6 +111,7 @@ type simConfig struct {
 	reconnectMin        time.Duration
 	reconnectMax        time.Duration
 	postCommandCoolDown time.Duration
+	frameMode           protocol.FrameMode
 }
 
 type controllerState struct {
@@ -160,6 +167,17 @@ func resolveProfileCycle(primary, mix string) ([]string, error) {
 		return nil, fmt.Errorf("profile-mix must contain at least one valid profile")
 	}
 	return out, nil
+}
+
+func parseFrameMode(name string) (protocol.FrameMode, error) {
+	switch strings.TrimSpace(strings.ToLower(name)) {
+	case "", "compact":
+		return protocol.FrameModeCompact, nil
+	case "sequenced":
+		return protocol.FrameModeSequenced, nil
+	default:
+		return protocol.FrameModeAuto, fmt.Errorf("unknown frame mode %q", name)
+	}
 }
 
 func applyProfile(base simConfig, profileName string) (simConfig, error) {
@@ -236,7 +254,7 @@ func serveConn(done <-chan struct{}, conn net.Conn, imei string, cfg simConfig, 
 	reader := bufio.NewReader(conn)
 	var writeMu sync.Mutex
 
-	if err := writeFrame(conn, &writeMu, buildRegistrationPayload(imei)); err != nil {
+	if err := writeFrame(conn, &writeMu, cfg.frameMode, buildRegistrationPayload(imei)); err != nil {
 		return err
 	}
 
@@ -246,7 +264,7 @@ func serveConn(done <-chan struct{}, conn net.Conn, imei string, cfg simConfig, 
 	errCh := make(chan error, 1)
 	go func() {
 		for {
-			frame, err := protocol.ReadFrame(reader)
+			frame, err := protocol.ReadFrameWithMode(reader, protocol.FrameModeAuto)
 			if err != nil {
 				errCh <- err
 				return
@@ -278,7 +296,7 @@ func serveConn(done <-chan struct{}, conn net.Conn, imei string, cfg simConfig, 
 			return err
 		case <-ticker.C:
 			for i := 0; i < cfg.burstSize; i++ {
-				if err := writeFrame(conn, &writeMu, buildStatus1Payload(state.bufferFree, 0)); err != nil {
+				if err := writeFrame(conn, &writeMu, cfg.frameMode, buildStatus1Payload(state.bufferFree, 0)); err != nil {
 					return err
 				}
 				if i < cfg.burstSize-1 && cfg.burstSpacing > 0 {
@@ -347,7 +365,7 @@ func sendCommandAck(conn net.Conn, mu *sync.Mutex, seq, code uint8, bufferFree u
 	if cfg.ackDelay > 0 {
 		time.Sleep(cfg.ackDelay)
 	}
-	return writeFrame(conn, mu, buildAck11Payload(seq, code, bufferFree))
+	return writeFrame(conn, mu, cfg.frameMode, buildAck11Payload(seq, code, bufferFree))
 }
 
 func commandDelay(timeout uint8, cfg simConfig) time.Duration {
@@ -360,8 +378,8 @@ func commandDelay(timeout uint8, cfg simConfig) time.Duration {
 	return time.Duration(timeout) * time.Second
 }
 
-func writeFrame(conn net.Conn, mu *sync.Mutex, payload []byte) error {
-	wire, err := protocol.EncodeFrame(protocol.Frame{TTL: 255, Seq: 1, Payload: payload})
+func writeFrame(conn net.Conn, mu *sync.Mutex, mode protocol.FrameMode, payload []byte) error {
+	wire, err := protocol.EncodeFrame(protocol.Frame{TTL: 255, Seq: 1, Payload: payload, Mode: mode})
 	if err != nil {
 		return err
 	}
