@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"tcpadapter/internal/buildinfo"
 	"tcpadapter/internal/config"
 	"tcpadapter/internal/kafka"
 	"tcpadapter/internal/queue"
@@ -166,6 +167,9 @@ func TestIndexHandler(t *testing.T) {
 	body := rr.Body.String()
 	if !strings.Contains(body, "/healthz") || !strings.Contains(body, "/metrics") || !strings.Contains(body, "/debug/dashboard") || !strings.Contains(body, "/debug/queues?limit=20") || !strings.Contains(body, "/debug/logs") {
 		t.Fatalf("expected endpoint links in body, got: %s", body)
+	}
+	if !strings.Contains(body, "build-badge") {
+		t.Fatalf("expected build badge in body, got: %s", body)
 	}
 
 	req = httptest.NewRequest("GET", "/missing", nil)
@@ -413,6 +417,9 @@ func TestDebugDashboardAndEventsHandlers(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	sessions := session.NewManager(10, 100, 1048576, "drop_oldest", store.NewInMemoryStore())
 	srv := New(cfg, logger, sessions, noopBus{})
+	buildinfo.Version = "test-version"
+	buildinfo.Commit = "test-commit-sha"
+	buildinfo.BuildTime = "test-build-time"
 
 	_ = sessions.Enqueue("imei-dash", queueCommand(10))
 	c1, c2 := net.Pipe()
@@ -456,6 +463,9 @@ func TestDebugDashboardAndEventsHandlers(t *testing.T) {
 	}
 	if dash.Summary.KnownSessions == 0 || len(dash.Connections) == 0 || len(dash.Events) == 0 {
 		t.Fatalf("unexpected dashboard payload: %+v", dash)
+	}
+	if dash.Summary.BuildVersion != "test-version" || dash.Summary.BuildCommit != "test-commit-sha" {
+		t.Fatalf("expected build info in dashboard summary, got: %+v", dash.Summary)
 	}
 
 	req = httptest.NewRequest("GET", "/debug/connections?limit=10", nil)

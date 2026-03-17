@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"tcpadapter/internal/buildinfo"
 	"tcpadapter/internal/kafka"
 	"tcpadapter/internal/protocol"
 	"tcpadapter/internal/queue"
@@ -367,6 +368,9 @@ type dashboardSummary struct {
 	AckExpired              uint64  `json:"ack_expired"`
 	AckDelivered            uint64  `json:"ack_delivered"`
 	TelemetryFramesObserved uint64  `json:"telemetry_frames_observed"`
+	BuildVersion            string  `json:"build_version"`
+	BuildCommit             string  `json:"build_commit"`
+	BuildTime               string  `json:"build_time"`
 }
 
 func (s *Server) dashboardSummary() dashboardSummary {
@@ -410,6 +414,9 @@ func (s *Server) dashboardSummary() dashboardSummary {
 		AckExpired:              expired,
 		AckDelivered:            delivered,
 		TelemetryFramesObserved: telemetryTotal,
+		BuildVersion:            buildinfo.Version,
+		BuildCommit:             buildinfo.Commit,
+		BuildTime:               buildinfo.BuildTime,
 	}
 }
 
@@ -895,6 +902,7 @@ func renderDashboardHTML() string {
           <span class="badge"><a href="/debug/events?limit=100">/debug/events</a></span>
           <span class="badge"><a href="/debug/logs">/debug/logs</a></span>
           <span class="badge"><a href="/debug/command-builder">/debug/command-builder</a></span>
+          <span class="badge">build <span id="build-badge">loading</span></span>
         </div>
       </section>
       <section class="panel hero-side">
@@ -1040,6 +1048,11 @@ func renderDashboardHTML() string {
           '<div class="meta">' + meta + '</div>' +
         '</section>'
       )).join("");
+      const buildBadge = document.getElementById("build-badge");
+      if (buildBadge) {
+        const commit = text(summary.build_commit).slice(0, 12);
+        buildBadge.textContent = commit + ' · ' + text(summary.build_version);
+      }
     }
 
     function renderConnections(items) {

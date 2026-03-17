@@ -41,6 +41,10 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
+          build-args: |
+            VERSION=main
+            COMMIT=${{ github.sha }}
+            BUILD_TIME=${{ github.run_id }}
           tags: |
             ${{ steps.image.outputs.name }}:${{ github.sha }}
             ${{ steps.image.outputs.name }}:main

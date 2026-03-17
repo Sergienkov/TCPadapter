@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"tcpadapter/internal/buildinfo"
 	"tcpadapter/internal/config"
 	"tcpadapter/internal/kafka"
 	"tcpadapter/internal/server"
@@ -22,6 +23,7 @@ func main() {
 		logger.Error("failed to load config", "error", err)
 		os.Exit(1)
 	}
+	logger.Info("build info", "version", buildinfo.Version, "commit", buildinfo.Commit, "build_time", buildinfo.BuildTime)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
