@@ -184,6 +184,85 @@ func TestE2EExpireWhenNoAck(t *testing.T) {
 	}
 }
 
+func TestE2EOfflineExpiredCommandPublishesExpiredAckOnReconnect(t *testing.T) {
+	listenAddr := freeTCPAddr(t)
+	metricsAddr := freeTCPAddr(t)
+
+	cfg := config.Config{
+		ListenAddr:         listenAddr,
+		MetricsAddr:        metricsAddr,
+		RegistrationWindow: 2 * time.Second,
+		HeartbeatTimeout:   30 * time.Second,
+		MaxConnections:     100,
+		MaxQueueDepth:      100,
+		MaxQueueBytes:      1 << 20,
+		QueueOverflow:      "drop_oldest",
+		AckTimeout:         150 * time.Millisecond,
+		RetryBackoff:       50 * time.Millisecond,
+		MaxRetries:         3,
+		SweepInterval:      40 * time.Millisecond,
+		WriteTimeout:       1 * time.Second,
+		ReadTimeout:        5 * time.Second,
+		DebugLogs:          false,
+		StateFile:          "",
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	sessions := session.NewManager(cfg.MaxConnections, cfg.MaxQueueDepth, cfg.MaxQueueBytes, cfg.QueueOverflow, store.NewInMemoryStore())
+	bus := &captureBus{}
+	srv := New(cfg, logger, sessions, bus)
+
+	controllerID := "860000000009999"
+	expired := queue.Command{
+		MessageID: "offline-expired-1",
+		TraceID:   "trace-offline-expired-1",
+		CommandID: 9,
+		TTL:       250 * time.Millisecond,
+		CreatedAt: time.Now().UTC().Add(-2 * time.Second),
+	}
+	if err := sessions.Enqueue(controllerID, expired); err != nil {
+		t.Fatalf("Enqueue() error = %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- srv.Run(ctx)
+	}()
+	waitTCPReady(t, listenAddr, 3*time.Second)
+
+	go runControllerNoAck(t, ctx, listenAddr, controllerID)
+
+	waitForAckStatus(t, bus, expired.MessageID, "expired", 5*time.Second)
+
+	stats := sessions.SessionStats(100)
+	found := false
+	for _, stat := range stats {
+		if stat.ControllerID == controllerID {
+			found = true
+			if stat.QueueDepth != 0 {
+				t.Fatalf("expected expired command to be drained from queue, got depth=%d", stat.QueueDepth)
+			}
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected controller %s in session stats", controllerID)
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("server run error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not stop in time")
+	}
+}
+
 func TestE2ETelemetryTraceIDGenerated(t *testing.T) {
 	listenAddr := freeTCPAddr(t)
 	metricsAddr := freeTCPAddr(t)

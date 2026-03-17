@@ -790,6 +790,18 @@ func renderDashboardHTML() string {
       overflow: auto;
       padding-right: 4px;
     }
+    .toolbar {
+      display: grid;
+      grid-template-columns: 180px minmax(0, 1fr) 140px;
+      gap: 10px;
+      margin-bottom: 12px;
+      align-items: center;
+    }
+    .toolbar .status {
+      text-align: right;
+      color: var(--muted);
+      font-size: 13px;
+    }
     .event {
       display: grid;
       grid-template-columns: 72px 108px 1fr;
@@ -835,7 +847,7 @@ func renderDashboardHTML() string {
       gap: 10px;
     }
     .enqueue-form .full { grid-column: 1 / -1; }
-    input, textarea, button {
+    input, textarea, button, select {
       width: 100%;
       font: inherit;
       border-radius: 12px;
@@ -862,6 +874,8 @@ func renderDashboardHTML() string {
     }
     @media (max-width: 720px) {
       .enqueue-form, .detail-grid { grid-template-columns: 1fr; }
+      .toolbar { grid-template-columns: 1fr; }
+      .toolbar .status { text-align: left; }
       .event { grid-template-columns: 1fr; }
     }
   </style>
@@ -964,14 +978,34 @@ func renderDashboardHTML() string {
             <h2>Recent Waterfall</h2>
             <div class="muted">RX / TX / ACK</div>
           </div>
-          <div id="events-body" class="section-body waterfall"></div>
+          <div class="section-body">
+            <div class="toolbar">
+              <select id="event-kind-filter">
+                <option value="all">All Events</option>
+                <option value="tx">Only TX</option>
+                <option value="rx">Only RX</option>
+                <option value="ack">Only ACK</option>
+              </select>
+              <input id="event-imei-filter" placeholder="Filter by IMEI / controller_id">
+              <button id="pause-refresh" type="button">Pause Live</button>
+              <div id="waterfall-status" class="status">Live updates enabled</div>
+            </div>
+            <div id="events-body" class="waterfall"></div>
+          </div>
         </section>
       </section>
     </div>
   </div>
 
   <script>
-    const state = { selectedControllerID: null };
+    const state = {
+      selectedControllerID: null,
+      eventKindFilter: 'all',
+      eventIMEIFilter: '',
+      paused: false,
+      events: [],
+      refreshTimer: null
+    };
 
     function fmtTime(value) {
       if (!value) return "n/a";
@@ -1064,9 +1098,21 @@ func renderDashboardHTML() string {
     }
 
     function renderEvents(items) {
-      window.__dashboardEvents = items;
+      state.events = items || [];
+      window.__dashboardEvents = state.events;
       const selectedID = state.selectedControllerID;
-      const filtered = selectedID ? items.filter((item) => item.controller_id === selectedID).concat(items.filter((item) => item.controller_id !== selectedID)).slice(0, 80) : items.slice(0, 80);
+      const imeiFilter = state.eventIMEIFilter.trim().toLowerCase();
+      let filtered = state.events.filter((item) => {
+        if (state.eventKindFilter !== 'all' && item.kind !== state.eventKindFilter) return false;
+        if (imeiFilter && !(item.controller_id || '').toLowerCase().includes(imeiFilter)) return false;
+        return true;
+      });
+      if (selectedID && !imeiFilter) {
+        filtered = filtered
+          .filter((item) => item.controller_id === selectedID)
+          .concat(filtered.filter((item) => item.controller_id !== selectedID));
+      }
+      filtered = filtered.slice(0, 120);
       const body = document.getElementById("events-body");
       body.innerHTML = filtered.map((item) => {
         const title = (item.controller_id || "unknown") + ' · cmd ' + item.command_id + ' · seq ' + item.command_seq;
@@ -1086,9 +1132,12 @@ func renderDashboardHTML() string {
           '</div>' +
         '</div>';
       }).join("");
+      document.getElementById('waterfall-status').textContent =
+        (state.paused ? 'Paused' : 'Live updates enabled') + ' · showing ' + filtered.length + ' events';
     }
 
     async function refresh() {
+      if (state.paused) return;
       const res = await fetch('/debug/dashboard?limit=120', { cache: 'no-store' });
       if (!res.ok) throw new Error('dashboard fetch failed: ' + res.status);
       const data = await res.json();
@@ -1124,10 +1173,29 @@ func renderDashboardHTML() string {
       });
     });
 
+    document.getElementById('event-kind-filter').addEventListener('change', (ev) => {
+      state.eventKindFilter = ev.currentTarget.value;
+      renderEvents(state.events);
+    });
+
+    document.getElementById('event-imei-filter').addEventListener('input', (ev) => {
+      state.eventIMEIFilter = ev.currentTarget.value;
+      renderEvents(state.events);
+    });
+
+    document.getElementById('pause-refresh').addEventListener('click', (ev) => {
+      state.paused = !state.paused;
+      ev.currentTarget.textContent = state.paused ? 'Resume Live' : 'Pause Live';
+      renderEvents(state.events);
+      if (!state.paused) {
+        refresh().catch(() => {});
+      }
+    });
+
     refresh().catch((err) => {
       document.getElementById('enqueue-result').textContent = err.message;
     });
-    setInterval(() => refresh().catch(() => {}), 3000);
+    state.refreshTimer = setInterval(() => refresh().catch(() => {}), 3000);
   </script>
 </body>
 </html>`

@@ -73,24 +73,6 @@ func (q *ControllerQueue) PopNext(now time.Time, fwMode, syncMode bool) (Command
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	pruneExpired := func(in []Command) []Command {
-		if len(in) == 0 {
-			return in
-		}
-		out := in[:0]
-		for _, c := range in {
-			if !c.Expired(now) {
-				out = append(out, c)
-			}
-		}
-		return out
-	}
-
-	q.high = pruneExpired(q.high)
-	q.fw = pruneExpired(q.fw)
-	q.sync = pruneExpired(q.sync)
-	q.query = pruneExpired(q.query)
-
 	pop := func(buf *[]Command) (Command, bool) {
 		if len(*buf) == 0 {
 			return Command{}, false
@@ -128,6 +110,39 @@ func (q *ControllerQueue) PopNext(now time.Time, fwMode, syncMode bool) (Command
 		return cmd, true
 	}
 	return Command{}, false
+}
+
+func (q *ControllerQueue) DrainExpired(now time.Time) []Command {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	drain := func(in []Command) ([]Command, []Command) {
+		if len(in) == 0 {
+			return in, nil
+		}
+		keep := in[:0]
+		var expired []Command
+		for _, c := range in {
+			if c.Expired(now) {
+				expired = append(expired, c)
+				continue
+			}
+			keep = append(keep, c)
+		}
+		return keep, expired
+	}
+
+	var expired []Command
+	var drained []Command
+	q.high, drained = drain(q.high)
+	expired = append(expired, drained...)
+	q.fw, drained = drain(q.fw)
+	expired = append(expired, drained...)
+	q.sync, drained = drain(q.sync)
+	expired = append(expired, drained...)
+	q.query, drained = drain(q.query)
+	expired = append(expired, drained...)
+	return expired
 }
 
 func (q *ControllerQueue) Len() int {

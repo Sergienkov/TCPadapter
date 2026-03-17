@@ -48,6 +48,11 @@ func TestTTLExpiry(t *testing.T) {
 	q.Push(Command{CommandID: 2, Priority: PriorityHigh, CreatedAt: now.Add(-11 * time.Second), TTL: 10 * time.Second})
 	q.Push(Command{CommandID: 3, Priority: PriorityHigh, CreatedAt: now, TTL: 10 * time.Second})
 
+	expired := q.DrainExpired(now)
+	if len(expired) != 1 || expired[0].CommandID != 2 {
+		t.Fatalf("expected drained expired cmd 2, got %#v", expired)
+	}
+
 	cmd, ok := q.PopNext(now, false, false)
 	if !ok {
 		t.Fatal("expected non-expired command")

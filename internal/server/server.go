@@ -412,6 +412,16 @@ func (s *Server) flushQueue(ctx context.Context, controllerID string) error {
 	remaining := maxBudget
 
 	for remaining > 0 {
+		for _, expired := range dctx.Queue.DrainExpired(time.Now().UTC()) {
+			s.publishAckWithCommand(ctx, kafka.AckEvent{
+				MessageID:    expired.MessageID,
+				TraceID:      expired.TraceID,
+				ControllerID: controllerID,
+				CommandID:    expired.CommandID,
+				Status:       "expired",
+				Reason:       "ttl expired before send",
+			}, expired)
+		}
 		scan := dctx.Queue.Len()
 		if scan == 0 {
 			return nil
