@@ -1,6 +1,7 @@
 package session
 
 import (
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -8,6 +9,15 @@ import (
 	"tcpadapter/internal/queue"
 	"tcpadapter/internal/store"
 )
+
+type failingStore struct {
+	saveErr   error
+	deleteErr error
+}
+
+func (s failingStore) SaveSession(store.SessionSnapshot) error        { return s.saveErr }
+func (s failingStore) DeleteSession(string) error                     { return s.deleteErr }
+func (s failingStore) ListSessions() ([]store.SessionSnapshot, error) { return nil, nil }
 
 func TestRestoreSessionWithQueue(t *testing.T) {
 	st := store.NewInMemoryStore()
@@ -276,43 +286,69 @@ func TestInFlightExpiresByTTL(t *testing.T) {
 	}
 }
 
-func TestAckSingleInFlightFallback(t *testing.T) {
+func TestCreateReturnsPersistError(t *testing.T) {
+	wantErr := errors.New("save failed")
+	m := NewManager(100, 1000, 1048576, "drop_oldest", failingStore{saveErr: wantErr})
+
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	if _, err := m.Create("imei-persist", c1); !errors.Is(err, wantErr) {
+		t.Fatalf("Create() error = %v, want %v", err, wantErr)
+	}
+	if _, ok := m.Get("imei-persist"); ok {
+		t.Fatal("session should not remain in memory after persist failure")
+	}
+}
+
+func TestEnqueueReturnsPersistError(t *testing.T) {
+	wantErr := errors.New("save failed")
+	m := NewManager(100, 1000, 1048576, "drop_oldest", failingStore{saveErr: wantErr})
+
+	err := m.Enqueue("imei-persist", queue.Command{
+		MessageID: "m1",
+		CommandID: 8,
+		Priority:  queue.PriorityHigh,
+		CreatedAt: time.Now().UTC(),
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("Enqueue() error = %v, want %v", err, wantErr)
+	}
+}
+
+func TestAckInFlightDoesNotDropEntryOnPersistError(t *testing.T) {
 	st := store.NewInMemoryStore()
 	m := NewManager(100, 1000, 1048576, "drop_oldest", st)
 
 	c1, c2 := net.Pipe()
 	defer c1.Close()
 	defer c2.Close()
-	_, err := m.Create("imei-fallback", c1)
+	_, err := m.Create("imei-ack", c1)
 	if err != nil {
 		t.Fatalf("Create() error = %v", err)
 	}
 
 	cmd := queue.Command{
-		MessageID: "m-fallback",
+		MessageID: "m-ack",
 		CommandID: 9,
 		Priority:  queue.PriorityQuery,
 		CreatedAt: time.Now().UTC(),
-		TTL:       10 * time.Second,
 	}
-	seq, err := m.NextCommandSeq("imei-fallback")
+	seq, err := m.NextCommandSeq("imei-ack")
 	if err != nil {
 		t.Fatalf("NextCommandSeq() error = %v", err)
 	}
-	if err := m.RegisterInFlight("imei-fallback", seq, cmd, time.Now().UTC()); err != nil {
+	if err := m.RegisterInFlight("imei-ack", seq, cmd, time.Now().UTC()); err != nil {
 		t.Fatalf("RegisterInFlight() error = %v", err)
 	}
 
-	gotSeq, gotCmd, gotAttempts, ok := m.AckSingleInFlightFallback("imei-fallback")
-	if !ok {
-		t.Fatal("expected fallback ack to match single in-flight entry")
+	m.store = failingStore{saveErr: errors.New("save failed")}
+	if _, _, ok := m.AckInFlight("imei-ack", seq); ok {
+		t.Fatal("AckInFlight() should report failure when persistence fails")
 	}
-	if gotSeq != seq || gotCmd.MessageID != cmd.MessageID || gotAttempts != 1 {
-		t.Fatalf("unexpected fallback result seq=%d cmd=%+v attempts=%d", gotSeq, gotCmd, gotAttempts)
-	}
-
-	if _, _, _, ok := m.AckSingleInFlightFallback("imei-fallback"); ok {
-		t.Fatal("expected no in-flight entries after fallback ack")
+	if got := m.InFlightCount("imei-ack"); got != 1 {
+		t.Fatalf("expected in-flight entry to remain after persist failure, got %d", got)
 	}
 }
 

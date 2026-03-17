@@ -784,6 +784,105 @@ func runControllerAckInProgressThenDone(t *testing.T, ctx context.Context, addr,
 	}
 }
 
+func TestE2EUnknownTerminalAckDoesNotAcknowledgeCurrentInFlight(t *testing.T) {
+	listenAddr := freeTCPAddr(t)
+	metricsAddr := freeTCPAddr(t)
+
+	cfg := config.Config{
+		ListenAddr:         listenAddr,
+		MetricsAddr:        metricsAddr,
+		RegistrationWindow: 2 * time.Second,
+		HeartbeatTimeout:   30 * time.Second,
+		MaxConnections:     100,
+		MaxQueueDepth:      100,
+		MaxQueueBytes:      1 << 20,
+		QueueOverflow:      "drop_oldest",
+		AckTimeout:         5 * time.Second,
+		RetryBackoff:       50 * time.Millisecond,
+		MaxRetries:         1,
+		SweepInterval:      40 * time.Millisecond,
+		WriteTimeout:       1 * time.Second,
+		ReadTimeout:        5 * time.Second,
+		DebugLogs:          false,
+		StateFile:          "",
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	sessions := session.NewManager(cfg.MaxConnections, cfg.MaxQueueDepth, cfg.MaxQueueBytes, cfg.QueueOverflow, store.NewInMemoryStore())
+	bus := &captureBus{}
+	srv := New(cfg, logger, sessions, bus)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.Run(ctx) }()
+	waitTCPReady(t, listenAddr, 3*time.Second)
+
+	conn, err := net.DialTimeout("tcp", listenAddr, 500*time.Millisecond)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+	r := bufio.NewReader(conn)
+
+	controllerID := "860000000000333"
+	if err := writeFrame(conn, buildRegistrationPayload(controllerID)); err != nil {
+		t.Fatalf("registration write failed: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+	if _, err := protocol.ReadFrame(r); err != nil {
+		t.Fatalf("read registration ack failed: %v", err)
+	}
+	if err := writeFrame(conn, buildStatus1Payload(1500)); err != nil {
+		t.Fatalf("status1 write failed: %v", err)
+	}
+
+	cmd := queue.Command{
+		MessageID: "m-unknown-ack",
+		CommandID: 9,
+		Priority:  queue.PriorityQuery,
+		CreatedAt: time.Now().UTC(),
+		TTL:       30 * time.Second,
+	}
+	if err := srv.EnqueueCommand(controllerID, cmd); err != nil {
+		t.Fatalf("EnqueueCommand() error = %v", err)
+	}
+
+	var sentSeq uint8
+	waitUntil(t, 3*time.Second, func() bool {
+		seqs := sessions.InFlightSeqs(controllerID)
+		if len(seqs) != 1 {
+			return false
+		}
+		sentSeq = seqs[0]
+		return true
+	}, "expected one in-flight command")
+
+	if err := writeFrame(conn, buildAck11Payload(sentSeq+1, 0, 1500)); err != nil {
+		t.Fatalf("wrong-seq ack write failed: %v", err)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	if got := sessions.InFlightCount(controllerID); got != 1 {
+		t.Fatalf("expected in-flight command to remain after wrong-seq ack, got %d", got)
+	}
+	for _, ack := range bus.snapshot() {
+		if ack.MessageID == cmd.MessageID && isTerminalAckStatus(ack.Status) {
+			t.Fatalf("unexpected terminal ack for current in-flight command after wrong-seq ack: %+v", ack)
+		}
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("server run error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not stop in time")
+	}
+}
+
 func waitForAckStatus(t *testing.T, bus *captureBus, messageID, status string, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)

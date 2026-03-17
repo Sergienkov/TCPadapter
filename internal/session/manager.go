@@ -105,6 +105,20 @@ type ControllerQueueStat struct {
 	LastSeen     time.Time `json:"last_seen"`
 }
 
+type ControllerSessionStat struct {
+	ControllerID string    `json:"controller_id"`
+	RemoteAddr   string    `json:"remote_addr"`
+	QueueDepth   int       `json:"queue_depth"`
+	QueueBytes   int       `json:"queue_bytes"`
+	InFlight     int       `json:"in_flight"`
+	Online       bool      `json:"online"`
+	LastSeen     time.Time `json:"last_seen"`
+	BufferFree   int       `json:"buffer_free"`
+	FWMode       bool      `json:"fw_mode"`
+	SyncMode     bool      `json:"sync_mode"`
+	NextSeq      uint8     `json:"next_seq"`
+}
+
 func NewManager(maxConns, maxQueueDepth, maxQueueBytes int, overflowPolicy string, st store.Store) *Manager {
 	if overflowPolicy == "" {
 		overflowPolicy = "drop_oldest"
@@ -127,12 +141,18 @@ func (m *Manager) Create(controllerID string, conn net.Conn) (*Session, error) {
 		if existing.Conn != nil {
 			return nil, ErrSessionExists
 		}
+		prevConn := existing.Conn
+		prevLastSeen := existing.LastSeen
 		existing.Conn = conn
 		existing.LastSeen = time.Now().UTC()
 		if existing.BufferFree <= 0 {
 			existing.BufferFree = 1500
 		}
-		_ = m.persistLocked(existing)
+		if err := m.persistLocked(existing); err != nil {
+			existing.Conn = prevConn
+			existing.LastSeen = prevLastSeen
+			return nil, err
+		}
 		return existing, nil
 	}
 	if m.onlineConnectionsLocked() >= m.maxConns {
@@ -151,7 +171,10 @@ func (m *Manager) Create(controllerID string, conn net.Conn) (*Session, error) {
 		NextSeq:                0,
 	}
 	m.sessions[controllerID] = s
-	_ = m.persistLocked(s)
+	if err := m.persistLocked(s); err != nil {
+		delete(m.sessions, controllerID)
+		return nil, err
+	}
 	return s, nil
 }
 
@@ -162,14 +185,15 @@ func (m *Manager) Delete(controllerID string) {
 	_ = m.store.DeleteSession(controllerID)
 }
 
-func (m *Manager) MarkOffline(controllerID string) {
+func (m *Manager) MarkOffline(controllerID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if s, ok := m.sessions[controllerID]; ok {
 		s.Conn = nil
 		s.LastSeen = time.Now().UTC()
-		_ = m.persistLocked(s)
+		return m.persistLocked(s)
 	}
+	return nil
 }
 
 func (m *Manager) Get(controllerID string) (*Session, bool) {
@@ -210,7 +234,11 @@ func (m *Manager) EnqueueWithEvents(controllerID string, cmd queue.Command) ([]O
 func (m *Manager) enqueueLocked(controllerID string, cmd queue.Command, events *[]OverflowEvent) error {
 	s, ok := m.sessions[controllerID]
 	if !ok {
-		s = m.createDetachedLocked(controllerID)
+		var err error
+		s, err = m.createDetachedLocked(controllerID)
+		if err != nil {
+			return err
+		}
 	}
 
 	if cmd.DedupKey != "" {
@@ -300,11 +328,10 @@ func (m *Manager) enqueueLocked(controllerID string, cmd queue.Command, events *
 	}
 
 	s.Queue.Push(cmd)
-	_ = m.persistLocked(s)
-	return nil
+	return m.persistLocked(s)
 }
 
-func (m *Manager) createDetachedLocked(controllerID string) *Session {
+func (m *Manager) createDetachedLocked(controllerID string) (*Session, error) {
 	now := time.Now().UTC()
 	s := &Session{
 		ControllerID:           controllerID,
@@ -318,8 +345,11 @@ func (m *Manager) createDetachedLocked(controllerID string) *Session {
 		NextSeq:                0,
 	}
 	m.sessions[controllerID] = s
-	_ = m.persistLocked(s)
-	return s
+	if err := m.persistLocked(s); err != nil {
+		delete(m.sessions, controllerID)
+		return nil, err
+	}
+	return s, nil
 }
 
 func (m *Manager) UpdateBufferFree(controllerID string, free int) {
@@ -330,22 +360,24 @@ func (m *Manager) UpdateBufferFree(controllerID string, free int) {
 	}
 }
 
-func (m *Manager) SetFWMode(controllerID string, enabled bool) {
+func (m *Manager) SetFWMode(controllerID string, enabled bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if s, ok := m.sessions[controllerID]; ok {
 		s.FWMode = enabled
-		_ = m.persistLocked(s)
+		return m.persistLocked(s)
 	}
+	return nil
 }
 
-func (m *Manager) SetSyncMode(controllerID string, enabled bool) {
+func (m *Manager) SetSyncMode(controllerID string, enabled bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if s, ok := m.sessions[controllerID]; ok {
 		s.SyncMode = enabled
-		_ = m.persistLocked(s)
+		return m.persistLocked(s)
 	}
+	return nil
 }
 
 func (m *Manager) DeliveryContext(controllerID string) (DeliveryContext, bool) {
@@ -365,12 +397,13 @@ func (m *Manager) DeliveryContext(controllerID string) (DeliveryContext, bool) {
 	}, true
 }
 
-func (m *Manager) AckSent(controllerID string) {
+func (m *Manager) AckSent(controllerID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if s, ok := m.sessions[controllerID]; ok {
-		_ = m.persistLocked(s)
+		return m.persistLocked(s)
 	}
+	return nil
 }
 
 func (m *Manager) Restore() (int, error) {
@@ -571,6 +604,50 @@ func (m *Manager) TopQueueStats(limit int) []ControllerQueueStat {
 	return out
 }
 
+func (m *Manager) SessionStats(limit int) []ControllerSessionStat {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	out := make([]ControllerSessionStat, 0, len(m.sessions))
+	for _, s := range m.sessions {
+		remote := ""
+		if s.Conn != nil && s.Conn.RemoteAddr() != nil {
+			remote = s.Conn.RemoteAddr().String()
+		}
+		out = append(out, ControllerSessionStat{
+			ControllerID: s.ControllerID,
+			RemoteAddr:   remote,
+			QueueDepth:   s.Queue.Len(),
+			QueueBytes:   s.Queue.TotalEstimatedBytes(),
+			InFlight:     len(s.InFlight),
+			Online:       s.Conn != nil,
+			LastSeen:     s.LastSeen,
+			BufferFree:   s.BufferFree,
+			FWMode:       s.FWMode,
+			SyncMode:     s.SyncMode,
+			NextSeq:      s.NextSeq,
+		})
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Online != out[j].Online {
+			return out[i].Online
+		}
+		if out[i].QueueDepth != out[j].QueueDepth {
+			return out[i].QueueDepth > out[j].QueueDepth
+		}
+		if !out[i].LastSeen.Equal(out[j].LastSeen) {
+			return out[i].LastSeen.After(out[j].LastSeen)
+		}
+		return out[i].ControllerID < out[j].ControllerID
+	})
+
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
 func (m *Manager) RegisterInFlight(controllerID string, seq uint8, cmd queue.Command, sentAt time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -585,8 +662,7 @@ func (m *Manager) RegisterInFlight(controllerID string, seq uint8, cmd queue.Com
 		SentAt:   sentAt,
 		Attempts: attempts,
 	}
-	_ = m.persistLocked(s)
-	return nil
+	return m.persistLocked(s)
 }
 
 func (m *Manager) AckInFlight(controllerID string, seq uint8) (queue.Command, int, bool) {
@@ -601,29 +677,11 @@ func (m *Manager) AckInFlight(controllerID string, seq uint8) (queue.Command, in
 		return queue.Command{}, 0, false
 	}
 	delete(s.InFlight, seq)
-	_ = m.persistLocked(s)
+	if err := m.persistLocked(s); err != nil {
+		s.InFlight[seq] = entry
+		return queue.Command{}, 0, false
+	}
 	return entry.Command, entry.Attempts, true
-}
-
-// AckSingleInFlightFallback acknowledges the only in-flight command for a controller.
-// It is intended as a defensive fallback for protocol variants where ACK command sequence
-// may be encoded inconsistently while only one command can be outstanding.
-func (m *Manager) AckSingleInFlightFallback(controllerID string) (uint8, queue.Command, int, bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	s, ok := m.sessions[controllerID]
-	if !ok {
-		return 0, queue.Command{}, 0, false
-	}
-	if len(s.InFlight) != 1 {
-		return 0, queue.Command{}, 0, false
-	}
-	for seq, entry := range s.InFlight {
-		delete(s.InFlight, seq)
-		_ = m.persistLocked(s)
-		return seq, entry.Command, entry.Attempts, true
-	}
-	return 0, queue.Command{}, 0, false
 }
 
 func (m *Manager) PeekInFlight(controllerID string, seq uint8) (queue.Command, int, bool) {
@@ -718,8 +776,7 @@ func (m *Manager) ProcessInFlight(controllerID string, now time.Time, resolver D
 		})
 	}
 
-	_ = m.persistLocked(s)
-	return out, nil
+	return out, m.persistLocked(s)
 }
 
 const (

@@ -151,6 +151,31 @@ func TestHealthzHandler(t *testing.T) {
 	}
 }
 
+func TestIndexHandler(t *testing.T) {
+	cfg := config.Config{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	sessions := session.NewManager(10, 100, 1048576, "drop_oldest", store.NewInMemoryStore())
+	srv := New(cfg, logger, sessions, noopBus{})
+
+	req := httptest.NewRequest("GET", "/", nil)
+	rr := httptest.NewRecorder()
+	srv.indexHandler(rr, req)
+	if rr.Code != 200 {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "/healthz") || !strings.Contains(body, "/metrics") || !strings.Contains(body, "/debug/dashboard") || !strings.Contains(body, "/debug/queues?limit=20") || !strings.Contains(body, "/debug/logs") {
+		t.Fatalf("expected endpoint links in body, got: %s", body)
+	}
+
+	req = httptest.NewRequest("GET", "/missing", nil)
+	rr = httptest.NewRecorder()
+	srv.indexHandler(rr, req)
+	if rr.Code != 404 {
+		t.Fatalf("expected 404 for non-root path, got %d", rr.Code)
+	}
+}
+
 func TestReadyzHandler(t *testing.T) {
 	cfg := config.Config{}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -315,5 +340,108 @@ func TestDebugEnqueueHandler_BadPayload(t *testing.T) {
 	srv.debugEnqueueHandler(rr, req)
 	if rr.Code != 400 {
 		t.Fatalf("expected 400, got %d", rr.Code)
+	}
+}
+
+func TestDebugDashboardAndEventsHandlers(t *testing.T) {
+	cfg := config.Config{DebugLogs: true}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	sessions := session.NewManager(10, 100, 1048576, "drop_oldest", store.NewInMemoryStore())
+	srv := New(cfg, logger, sessions, noopBus{})
+
+	_ = sessions.Enqueue("imei-dash", queueCommand(10))
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	if _, err := sessions.Create("imei-dash", c1); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	srv.recordDebugEvent(DebugEvent{
+		Timestamp:    time.Now().UTC(),
+		Kind:         "rx",
+		ControllerID: "imei-dash",
+		RemoteAddr:   "127.0.0.1:12345",
+		CommandID:    2,
+		CommandSeq:   7,
+		TraceID:      "trace-rx",
+		PayloadLen:   8,
+	})
+	srv.publishAck(context.Background(), kafka.AckEvent{
+		MessageID:    "m1",
+		TraceID:      "trace-ack",
+		ControllerID: "imei-dash",
+		CommandID:    9,
+		CommandSeq:   1,
+		Status:       "accepted",
+	})
+
+	req := httptest.NewRequest("GET", "/debug/dashboard?limit=10", nil)
+	rr := httptest.NewRecorder()
+	srv.debugDashboardHandler(rr, req)
+	if rr.Code != 200 {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+	var dash struct {
+		Summary     dashboardSummary                `json:"summary"`
+		Connections []session.ControllerSessionStat `json:"connections"`
+		Events      []DebugEvent                    `json:"events"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &dash); err != nil {
+		t.Fatalf("dashboard json decode error: %v", err)
+	}
+	if dash.Summary.KnownSessions == 0 || len(dash.Connections) == 0 || len(dash.Events) == 0 {
+		t.Fatalf("unexpected dashboard payload: %+v", dash)
+	}
+
+	req = httptest.NewRequest("GET", "/debug/connections?limit=10", nil)
+	rr = httptest.NewRecorder()
+	srv.debugConnectionsHandler(rr, req)
+	if rr.Code != 200 {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+	var conns struct {
+		Count int                             `json:"count"`
+		Items []session.ControllerSessionStat `json:"items"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &conns); err != nil {
+		t.Fatalf("connections json decode error: %v", err)
+	}
+	if conns.Count != 1 || len(conns.Items) != 1 || conns.Items[0].ControllerID != "imei-dash" {
+		t.Fatalf("unexpected connections payload: %+v", conns)
+	}
+
+	req = httptest.NewRequest("GET", "/debug/events?limit=5", nil)
+	rr = httptest.NewRecorder()
+	srv.debugEventsHandler(rr, req)
+	if rr.Code != 200 {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+	var events struct {
+		Count int          `json:"count"`
+		Items []DebugEvent `json:"items"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &events); err != nil {
+		t.Fatalf("events json decode error: %v", err)
+	}
+	if events.Count == 0 || len(events.Items) == 0 {
+		t.Fatalf("unexpected events payload: %+v", events)
+	}
+}
+
+func TestDebugLogsHandler(t *testing.T) {
+	cfg := config.Config{DebugLogs: true}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	sessions := session.NewManager(10, 100, 1048576, "drop_oldest", store.NewInMemoryStore())
+	srv := New(cfg, logger, sessions, noopBus{})
+
+	req := httptest.NewRequest("GET", "/debug/logs", nil)
+	rr := httptest.NewRecorder()
+	srv.debugLogsHandler(rr, req)
+	if rr.Code != 200 {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "docker compose logs -f --tail=200 adapter") || !strings.Contains(body, "registration timeout") {
+		t.Fatalf("unexpected body: %s", body)
 	}
 }

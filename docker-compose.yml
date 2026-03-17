@@ -8,7 +8,7 @@ services:
       POSTGRES_USER: tcpadapter
       POSTGRES_PASSWORD: tcpadapter
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - tcpadapter_pg:/var/lib/postgresql/data
     healthcheck:
@@ -36,7 +36,7 @@ services:
       TCPADAPTER_METRICS_ADDR: ":18080"
       TCPADAPTER_STORE_BACKEND: "postgres"
       TCPADAPTER_POSTGRES_DSN: "postgres://tcpadapter:tcpadapter@postgres:5432/tcpadapter?sslmode=disable"
-      TCPADAPTER_DEBUG: "false"
+      TCPADAPTER_DEBUG: "true"
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:18080/readyz"]
       interval: 10s

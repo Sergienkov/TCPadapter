@@ -51,6 +51,22 @@ type Server struct {
 	shutdownDrainLastSecs  float64
 	shutdownDrainTimeouts  uint64
 	connWG                 sync.WaitGroup
+	debugEventsMu          sync.Mutex
+	debugEvents            []DebugEvent
+}
+
+type DebugEvent struct {
+	Timestamp    time.Time `json:"timestamp"`
+	Kind         string    `json:"kind"`
+	ControllerID string    `json:"controller_id"`
+	RemoteAddr   string    `json:"remote_addr,omitempty"`
+	CommandID    uint8     `json:"command_id"`
+	CommandSeq   uint8     `json:"command_seq"`
+	MessageID    string    `json:"message_id,omitempty"`
+	TraceID      string    `json:"trace_id,omitempty"`
+	Status       string    `json:"status,omitempty"`
+	Reason       string    `json:"reason,omitempty"`
+	PayloadLen   int       `json:"payload_len"`
 }
 
 type ipSecurityState struct {
@@ -72,6 +88,7 @@ func New(cfg config.Config, logger *slog.Logger, sessions *session.Manager, bus 
 		conns:                  make(map[net.Conn]struct{}),
 		ipConnCount:            make(map[string]int),
 		ipSec:                  make(map[string]*ipSecurityState),
+		debugEvents:            make([]DebugEvent, 0, 256),
 	}
 }
 
@@ -151,7 +168,9 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	lastHeartbeat := time.Now().UTC()
 	defer func() {
 		if registered && controllerID != "" {
-			s.sessions.MarkOffline(controllerID)
+			if err := s.sessions.MarkOffline(controllerID); err != nil {
+				s.logger.Error("failed to persist offline session state", "controller_id", s.logControllerID(controllerID), "error", err)
+			}
 		}
 		s.active.Add(-1)
 		s.untrackConn(conn)
@@ -229,7 +248,9 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 				return
 			}
 			if err := s.sendRegistrationAck(conn, frame.Seq); err != nil {
-				s.sessions.MarkOffline(id)
+				if offErr := s.sessions.MarkOffline(id); offErr != nil {
+					s.logger.Error("failed to persist offline session state", "controller_id", s.logControllerID(id), "error", offErr)
+				}
 				s.logger.Warn("registration ack send failed", "remote", remote, "controller_id", s.logControllerID(id), "error", err)
 				return
 			}
@@ -251,7 +272,10 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 				s.sessions.UpdateBufferFree(controllerID, int(st.BufferFree))
 				// Controller advertises readiness for firmware update.
 				if protocol.Status1ReadyForFW(st.Flags) {
-					s.sessions.SetFWMode(controllerID, true)
+					if err := s.sessions.SetFWMode(controllerID, true); err != nil {
+						s.logger.Error("failed to persist fw mode", "controller_id", s.logControllerID(controllerID), "error", err)
+						return
+					}
 				}
 			}
 		case 11:
@@ -262,20 +286,6 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 				if interp.Terminal {
 					ackedSeq := ack.CommandSeq
 					cmd, attempts, ok := s.sessions.AckInFlight(controllerID, ack.CommandSeq)
-					if !ok {
-						if fallbackSeq, fallbackCmd, fallbackAttempts, fallbackOK := s.sessions.AckSingleInFlightFallback(controllerID); fallbackOK {
-							ackedSeq = fallbackSeq
-							cmd = fallbackCmd
-							attempts = fallbackAttempts
-							ok = true
-							s.logger.Warn("ack sequence mismatch; matched single in-flight fallback",
-								"controller_id", s.logControllerID(controllerID),
-								"ack_seq", ack.CommandSeq,
-								"matched_seq", fallbackSeq,
-								"code", ack.ExecutionCode,
-							)
-						}
-					}
 					if ok {
 						if cmd.TraceID != "" {
 							traceID = cmd.TraceID
@@ -329,12 +339,25 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		case 4:
 			fw, err := protocol.ParseFWStatus4Payload(frame.Payload)
 			if err == nil && (protocol.IsFWFinished(fw.ProgressOrErr) || protocol.IsFWFailed(fw.ProgressOrErr)) {
-				s.sessions.SetFWMode(controllerID, false)
+				if err := s.sessions.SetFWMode(controllerID, false); err != nil {
+					s.logger.Error("failed to persist fw mode", "controller_id", s.logControllerID(controllerID), "error", err)
+					return
+				}
 			}
 		}
 		if s.cfg.DebugLogs {
 			s.logger.Info("rx_frame", "controller_id", s.logControllerID(controllerID), "command_id", cmdID, "seq", frame.Seq, "trace_id", traceID, "payload_len", len(frame.Payload))
 		}
+		s.recordDebugEvent(DebugEvent{
+			Timestamp:    time.Now().UTC(),
+			Kind:         "rx",
+			ControllerID: controllerID,
+			RemoteAddr:   remote,
+			CommandID:    cmdID,
+			CommandSeq:   frame.Seq,
+			TraceID:      traceID,
+			PayloadLen:   len(frame.Payload),
+		})
 		s.publishTelemetry(ctx, kafka.TelemetryEvent{ControllerID: controllerID, CommandID: cmdID, TraceID: traceID, Payload: frame.Payload}, traceSource)
 
 		s.processInFlight(ctx, controllerID)
@@ -416,14 +439,6 @@ func (s *Server) flushQueue(ctx context.Context, controllerID string) error {
 				skipped = append(skipped, cmd)
 				continue
 			}
-			if cmd.CommandID >= 12 && cmd.CommandID <= 16 {
-				s.sessions.SetSyncMode(controllerID, true)
-				dctx.SyncMode = true
-			}
-			if cmd.CommandID == 19 {
-				s.sessions.SetFWMode(controllerID, true)
-				dctx.FWMode = true
-			}
 
 			payload := append([]byte{cmd.CommandID}, cmd.Payload...)
 			if err := protocol.ValidateServerCommandPayload(cmd.CommandID, cmd.Payload); err != nil {
@@ -478,9 +493,37 @@ func (s *Server) flushQueue(ctx context.Context, controllerID string) error {
 				}
 				return err
 			}
+			if cmd.CommandID >= 12 && cmd.CommandID <= 16 {
+				if err := s.sessions.SetSyncMode(controllerID, true); err != nil {
+					s.publishAckWithCommand(ctx, kafka.AckEvent{MessageID: cmd.MessageID, TraceID: cmd.TraceID, ControllerID: controllerID, CommandID: cmd.CommandID, Status: "failed", Reason: err.Error()}, cmd)
+					return err
+				}
+				dctx.SyncMode = true
+			}
+			if cmd.CommandID == 19 {
+				if err := s.sessions.SetFWMode(controllerID, true); err != nil {
+					s.publishAckWithCommand(ctx, kafka.AckEvent{MessageID: cmd.MessageID, TraceID: cmd.TraceID, ControllerID: controllerID, CommandID: cmd.CommandID, Status: "failed", Reason: err.Error()}, cmd)
+					return err
+				}
+				dctx.FWMode = true
+			}
+			s.recordDebugEvent(DebugEvent{
+				Timestamp:    time.Now().UTC(),
+				Kind:         "tx",
+				ControllerID: controllerID,
+				RemoteAddr:   dctx.Conn.RemoteAddr().String(),
+				CommandID:    cmd.CommandID,
+				CommandSeq:   seq,
+				MessageID:    cmd.MessageID,
+				TraceID:      cmd.TraceID,
+				PayloadLen:   len(cmd.Payload) + 1,
+			})
 			remaining -= len(frameBytes)
 			s.publishAck(ctx, kafka.AckEvent{MessageID: cmd.MessageID, TraceID: cmd.TraceID, ControllerID: controllerID, CommandID: cmd.CommandID, Status: "accepted", CommandSeq: seq})
-			s.sessions.AckSent(controllerID)
+			if err := s.sessions.AckSent(controllerID); err != nil {
+				s.publishAckWithCommand(ctx, kafka.AckEvent{MessageID: cmd.MessageID, TraceID: cmd.TraceID, ControllerID: controllerID, CommandID: cmd.CommandID, CommandSeq: seq, Status: "failed", Reason: err.Error()}, cmd)
+				return err
+			}
 			sent = true
 			break
 		}
@@ -493,13 +536,17 @@ func (s *Server) flushQueue(ctx context.Context, controllerID string) error {
 		}
 
 		if dctx.SyncMode && !dctx.Queue.HasSync() {
-			s.sessions.SetSyncMode(controllerID, false)
+			if err := s.sessions.SetSyncMode(controllerID, false); err != nil {
+				return err
+			}
 			dctx.SyncMode = false
 		}
 		if dctx.FWMode && !dctx.Queue.HasFW() {
 			// Keep FW mode enabled until status 4 completion, unless queue is drained and no progress state yet.
 			// This fallback prevents deadlock on empty FW queue.
-			s.sessions.SetFWMode(controllerID, false)
+			if err := s.sessions.SetFWMode(controllerID, false); err != nil {
+				return err
+			}
 			dctx.FWMode = false
 		}
 	}
@@ -742,6 +789,33 @@ func connRemoteHost(conn net.Conn) string {
 		return remote.String()
 	}
 	return host
+}
+
+const maxDebugEvents = 256
+
+func (s *Server) recordDebugEvent(event DebugEvent) {
+	if !s.cfg.DebugLogs {
+		return
+	}
+	s.debugEventsMu.Lock()
+	defer s.debugEventsMu.Unlock()
+	s.debugEvents = append(s.debugEvents, event)
+	if len(s.debugEvents) > maxDebugEvents {
+		s.debugEvents = append([]DebugEvent(nil), s.debugEvents[len(s.debugEvents)-maxDebugEvents:]...)
+	}
+}
+
+func (s *Server) debugEventsSnapshot(limit int) []DebugEvent {
+	s.debugEventsMu.Lock()
+	defer s.debugEventsMu.Unlock()
+	if limit <= 0 || limit > len(s.debugEvents) {
+		limit = len(s.debugEvents)
+	}
+	out := make([]DebugEvent, 0, limit)
+	for i := len(s.debugEvents) - 1; i >= 0 && len(out) < limit; i-- {
+		out = append(out, s.debugEvents[i])
+	}
+	return out
 }
 
 func newIncomingTraceID(controllerID string, cmdID, seq uint8) string {
