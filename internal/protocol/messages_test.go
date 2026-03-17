@@ -20,6 +20,17 @@ func TestParseRegistrationPayload(t *testing.T) {
 	}
 }
 
+func TestParseRegistrationPayload_InvalidIMEI(t *testing.T) {
+	p := make([]byte, 0, 18)
+	p = append(p, 1)
+	p = append(p, []byte("A23456789012345")...)
+	p = append(p, 3, 2)
+
+	if _, err := ParseRegistrationPayload(p); err == nil {
+		t.Fatal("expected invalid imei error")
+	}
+}
+
 func TestParseStatus1Payload(t *testing.T) {
 	p := make([]byte, 9)
 	p[0] = 2

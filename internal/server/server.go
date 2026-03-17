@@ -165,6 +165,7 @@ func (s *Server) Run(ctx context.Context) error {
 func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	registered := false
 	controllerID := ""
+	frameMode := protocol.FrameModeAuto
 	lastHeartbeat := time.Now().UTC()
 	defer func() {
 		if registered && controllerID != "" {
@@ -208,7 +209,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 			}
 		}
 		_ = conn.SetReadDeadline(time.Now().Add(readWait))
-		frame, err := protocol.ReadFrame(reader)
+		frame, err := protocol.ReadFrameWithMode(reader, frameMode)
 		if err != nil {
 			if isTimeout(err) {
 				s.logger.Warn("connection read timeout", "remote", remote)
@@ -247,7 +248,9 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 				s.logger.Warn("session create failed", "remote", remote, "controller_id", s.logControllerID(id), "error", err)
 				return
 			}
-			if err := s.sendRegistrationAck(conn, frame.Seq); err != nil {
+			frameMode = frame.Mode
+			s.sessions.SetFrameMode(id, frameMode)
+			if err := s.sendRegistrationAck(conn, frame.Mode, frame.Seq); err != nil {
 				if offErr := s.sessions.MarkOffline(id); offErr != nil {
 					s.logger.Error("failed to persist offline session state", "controller_id", s.logControllerID(id), "error", offErr)
 				}
@@ -257,7 +260,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 			registered = true
 			controllerID = id
 			lastHeartbeat = time.Now().UTC()
-			s.logger.Info("controller registered", "controller_id", s.logControllerID(controllerID), "remote", remote)
+			s.logger.Info("controller registered", "controller_id", s.logControllerID(controllerID), "remote", remote, "frame_mode", frame.Mode)
 		}
 
 		s.sessions.Touch(controllerID)
@@ -368,7 +371,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	}
 }
 
-func (s *Server) sendRegistrationAck(conn net.Conn, seq uint8) error {
+func (s *Server) sendRegistrationAck(conn net.Conn, mode protocol.FrameMode, seq uint8) error {
 	payload, err := (protocol.Cmd1RegistrationAckPayload{
 		ExecutionCode: protocol.AckCodeOK,
 		ServerTime:    uint32(time.Now().Unix()),
@@ -381,6 +384,7 @@ func (s *Server) sendRegistrationAck(conn net.Conn, seq uint8) error {
 		TTL:     255,
 		Seq:     seq,
 		Payload: append([]byte{protocol.CmdRegistrationAck}, payload...),
+		Mode:    mode,
 	})
 	if err != nil {
 		return err
@@ -474,7 +478,7 @@ func (s *Server) flushQueue(ctx context.Context, controllerID string) error {
 				}
 			}
 			cmd.RetrySeq = 0
-			frameBytes, err := protocol.EncodeFrame(protocol.Frame{TTL: ttlToWire(cmd.TTL), Seq: seq, Payload: payload})
+			frameBytes, err := protocol.EncodeFrame(protocol.Frame{TTL: ttlToWire(cmd.TTL), Seq: seq, Payload: payload, Mode: dctx.FrameMode})
 			if err != nil {
 				s.publishAckWithCommand(ctx, kafka.AckEvent{MessageID: cmd.MessageID, TraceID: cmd.TraceID, ControllerID: controllerID, CommandID: cmd.CommandID, Status: "failed", Reason: err.Error()}, cmd)
 				continue

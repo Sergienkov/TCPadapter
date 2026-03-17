@@ -3,6 +3,7 @@ package protocol
 import (
 	"encoding/binary"
 	"fmt"
+	"strings"
 )
 
 type Registration struct {
@@ -48,12 +49,28 @@ func ParseRegistrationPayload(payload []byte) (Registration, error) {
 	if imei == "" {
 		return Registration{}, fmt.Errorf("empty imei")
 	}
+	if !isDigitsOnly(imei) {
+		return Registration{}, fmt.Errorf("invalid imei: %q", imei)
+	}
 
 	return Registration{
 		IMEI:            imei,
 		ProtocolVersion: payload[16],
 		HWVersion:       payload[17],
 	}, nil
+}
+
+func isKnownCommandID(cmd uint8) bool {
+	switch cmd {
+	case 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 27:
+		return true
+	default:
+		return false
+	}
+}
+
+func isDigitsOnly(value string) bool {
+	return strings.IndexFunc(value, func(r rune) bool { return r < '0' || r > '9' }) == -1
 }
 
 func ParseStatus1Payload(payload []byte) (Status1, error) {

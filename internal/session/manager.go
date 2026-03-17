@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"tcpadapter/internal/protocol"
 	"tcpadapter/internal/queue"
 	"tcpadapter/internal/store"
 )
@@ -31,6 +32,7 @@ type Session struct {
 	Dedup                  map[string]time.Time
 	InFlight               map[uint8]InFlightEntry
 	NextSeq                uint8
+	FrameMode              protocol.FrameMode
 }
 
 type DeliveryContext struct {
@@ -40,6 +42,7 @@ type DeliveryContext struct {
 	BufferFree   int
 	FWMode       bool
 	SyncMode     bool
+	FrameMode    protocol.FrameMode
 }
 
 type InFlightEntry struct {
@@ -169,6 +172,7 @@ func (m *Manager) Create(controllerID string, conn net.Conn) (*Session, error) {
 		Dedup:                  make(map[string]time.Time),
 		InFlight:               make(map[uint8]InFlightEntry),
 		NextSeq:                0,
+		FrameMode:              protocol.FrameModeSequenced,
 	}
 	m.sessions[controllerID] = s
 	if err := m.persistLocked(s); err != nil {
@@ -343,6 +347,7 @@ func (m *Manager) createDetachedLocked(controllerID string) (*Session, error) {
 		Dedup:                  make(map[string]time.Time),
 		InFlight:               make(map[uint8]InFlightEntry),
 		NextSeq:                0,
+		FrameMode:              protocol.FrameModeSequenced,
 	}
 	m.sessions[controllerID] = s
 	if err := m.persistLocked(s); err != nil {
@@ -394,7 +399,16 @@ func (m *Manager) DeliveryContext(controllerID string) (DeliveryContext, bool) {
 		BufferFree:   s.BufferFree,
 		FWMode:       s.FWMode,
 		SyncMode:     s.SyncMode,
+		FrameMode:    s.FrameMode,
 	}, true
+}
+
+func (m *Manager) SetFrameMode(controllerID string, mode protocol.FrameMode) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if s, ok := m.sessions[controllerID]; ok {
+		s.FrameMode = mode
+	}
 }
 
 func (m *Manager) AckSent(controllerID string) error {
@@ -442,6 +456,7 @@ func (m *Manager) Restore() (int, error) {
 			Dedup:                  make(map[string]time.Time),
 			InFlight:               inFlight,
 			NextSeq:                snap.NextSeq,
+			FrameMode:              protocol.FrameModeSequenced,
 		}
 		if m.sessions[snap.ControllerID].BufferFree <= 0 {
 			m.sessions[snap.ControllerID].BufferFree = 1500
