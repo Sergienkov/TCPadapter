@@ -11,12 +11,14 @@ permissions:
   packages: write
 
 env:
-  REGISTRY: ghcr.io
-  DEPLOY_PATH: /opt/tcpadapter
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    env:
+      REGISTRY: ghcr.io
+      DEPLOY_PATH: /opt/tcpadapter
 
     steps:
       - name: Checkout
@@ -74,4 +76,10 @@ jobs:
             export TCPADAPTER_IMAGE="$IMAGE_NAME:$IMAGE_TAG"
             docker compose pull adapter
             docker compose up -d adapter
+            for _ in $(seq 1 30); do
+              if curl -fsS http://127.0.0.1:18080/readyz >/dev/null; then
+                exit 0
+              fi
+              sleep 2
+            done
             curl -fsS http://127.0.0.1:18080/readyz
