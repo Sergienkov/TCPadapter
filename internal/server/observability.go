@@ -32,6 +32,8 @@ func (s *Server) startObservability() *http.Server {
 	mux.HandleFunc("/debug/dashboard", s.debugDashboardHandler)
 	mux.HandleFunc("/debug/connections", s.debugConnectionsHandler)
 	mux.HandleFunc("/debug/events", s.debugEventsHandler)
+	mux.HandleFunc("/debug/raw", s.debugRawHandler)
+	mux.HandleFunc("/debug/raw-messages", s.debugRawMessagesHandler)
 	mux.HandleFunc("/debug/logs", s.debugLogsHandler)
 	mux.HandleFunc("/debug/command-builder", s.debugCommandBuilderHandler)
 	mux.HandleFunc("/debug/command-schema", s.debugCommandSchemaHandler)
@@ -475,6 +477,30 @@ func (s *Server) debugEventsHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) debugRawMessagesHandler(w http.ResponseWriter, r *http.Request) {
+	if !s.cfg.DebugLogs {
+		http.NotFound(w, r)
+		return
+	}
+
+	items := s.rawMessagesSnapshot(parseDebugLimit(r, 100, 250))
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"count": len(items),
+		"items": items,
+	})
+}
+
+func (s *Server) debugRawHandler(w http.ResponseWriter, r *http.Request) {
+	if !s.cfg.DebugLogs {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(renderRawMessagesHTML()))
+}
+
 func (s *Server) debugLogsHandler(w http.ResponseWriter, r *http.Request) {
 	if !s.cfg.DebugLogs {
 		http.NotFound(w, r)
@@ -900,6 +926,7 @@ func renderDashboardHTML() string {
           <span class="badge"><a href="/debug/queues?limit=20">/debug/queues</a></span>
           <span class="badge"><a href="/debug/connections?limit=100">/debug/connections</a></span>
           <span class="badge"><a href="/debug/events?limit=100">/debug/events</a></span>
+          <span class="badge"><a href="/debug/raw">/debug/raw</a></span>
           <span class="badge"><a href="/debug/logs">/debug/logs</a></span>
           <span class="badge"><a href="/debug/command-builder">/debug/command-builder</a></span>
           <span class="badge">build <span id="build-badge">loading</span></span>
@@ -1209,6 +1236,181 @@ func renderDashboardHTML() string {
       document.getElementById('enqueue-result').textContent = err.message;
     });
     state.refreshTimer = setInterval(() => refresh().catch(() => {}), 3000);
+  </script>
+</body>
+</html>`
+}
+
+func renderRawMessagesHTML() string {
+	return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TCPadapter Raw Messages</title>
+  <style>
+    :root {
+      --bg: #f4f1ea;
+      --panel: #fffaf2;
+      --ink: #1f1d1a;
+      --muted: #6f6559;
+      --line: #d8cebf;
+      --accent: #b6542a;
+      --rx: #0d6b8a;
+      --tx: #8a4f0d;
+      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--ink); }
+    .wrap { max-width: 1400px; margin: 0 auto; padding: 28px 20px 40px; }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 20px;
+      margin-bottom: 18px;
+    }
+    .toolbar {
+      display: grid;
+      grid-template-columns: 160px minmax(0, 1fr) 130px 120px;
+      gap: 10px;
+      align-items: center;
+      margin-top: 16px;
+    }
+    input, select, button {
+      width: 100%;
+      font: inherit;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      padding: 10px 12px;
+      background: #fff;
+      color: var(--ink);
+    }
+    button {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    .status { color: var(--muted); font-size: 13px; text-align: right; }
+    .list { display: grid; gap: 10px; }
+    .msg {
+      display: grid;
+      grid-template-columns: 90px 200px 1fr;
+      gap: 12px;
+      padding: 14px;
+      border-radius: 14px;
+      border: 1px solid var(--line);
+      background: #fff;
+      border-left: 5px solid var(--line);
+    }
+    .msg.rx { border-left-color: var(--rx); }
+    .msg.tx { border-left-color: var(--tx); }
+    .mono { font-family: "IBM Plex Mono", "SFMono-Regular", monospace; overflow-wrap: anywhere; }
+    .muted { color: var(--muted); }
+    .headline { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    a { color: var(--accent); }
+    @media (max-width: 900px) {
+      .toolbar, .msg { grid-template-columns: 1fr; }
+      .status { text-align: left; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <section class="panel">
+      <div class="headline">
+        <div>
+          <h1 style="margin:0 0 8px">Raw Wire Messages</h1>
+          <div class="muted">Последние сырые входящие и исходящие сообщения в hex. Показываем полный frame и отдельно payload.</div>
+        </div>
+        <div><a href="/">Back to dashboard</a></div>
+      </div>
+      <div class="toolbar">
+        <select id="direction-filter">
+          <option value="all">All directions</option>
+          <option value="tx">Only TX</option>
+          <option value="rx">Only RX</option>
+        </select>
+        <input id="imei-filter" placeholder="Filter by IMEI / controller_id">
+        <button id="pause-refresh" type="button">Pause Live</button>
+        <div id="raw-status" class="status">Live updates enabled</div>
+      </div>
+    </section>
+    <section class="panel">
+      <div id="raw-list" class="list"></div>
+    </section>
+  </div>
+  <script>
+    const state = { paused: false, items: [], direction: 'all', imei: '' };
+    function fmtTime(value) {
+      if (!value) return 'n/a';
+      const d = new Date(value);
+      if (Number.isNaN(d.getTime())) return value;
+      return d.toLocaleString();
+    }
+    function render(items) {
+      state.items = items || [];
+      const imei = state.imei.trim().toLowerCase();
+      const filtered = state.items.filter((item) => {
+        if (state.direction !== 'all' && item.direction !== state.direction) return false;
+        if (imei && !(item.controller_id || '').toLowerCase().includes(imei)) return false;
+        return true;
+      }).slice(0, 150);
+      document.getElementById('raw-list').innerHTML = filtered.map((item) => {
+        const meta = [
+          'cmd ' + item.command_id,
+          'seq ' + item.command_seq,
+          'ttl ' + item.ttl,
+          'mode ' + item.frame_mode,
+          item.remote_addr || '',
+          item.message_id ? 'msg=' + item.message_id : '',
+          item.trace_id ? 'trace=' + item.trace_id : ''
+        ].filter(Boolean).join(' · ');
+        return '<div class="msg ' + item.direction + '">' +
+          '<div><div><strong>' + item.direction.toUpperCase() + '</strong></div><div class="muted">' + fmtTime(item.timestamp) + '</div></div>' +
+          '<div><div class="mono">' + (item.controller_id || 'n/a') + '</div><div class="muted">' + meta + '</div></div>' +
+          '<div>' +
+            '<div class="muted">frame_hex</div><div class="mono">' + (item.raw_hex || '') + '</div>' +
+            '<div class="muted" style="margin-top:8px">payload_hex</div><div class="mono">' + (item.payload_hex || '') + '</div>' +
+          '</div>' +
+        '</div>';
+      }).join('');
+      document.getElementById('raw-status').textContent =
+        (state.paused ? 'Paused' : 'Live updates enabled') + ' · showing ' + filtered.length + ' messages';
+    }
+    async function refresh() {
+      if (state.paused) return;
+      const res = await fetch('/debug/raw-messages?limit=150', { cache: 'no-store' });
+      if (!res.ok) throw new Error('raw messages fetch failed: ' + res.status);
+      const data = await res.json();
+      render(data.items || []);
+    }
+    document.getElementById('direction-filter').addEventListener('change', (e) => {
+      state.direction = e.target.value;
+      render(state.items);
+    });
+    document.getElementById('imei-filter').addEventListener('input', (e) => {
+      state.imei = e.target.value;
+      render(state.items);
+    });
+    document.getElementById('pause-refresh').addEventListener('click', () => {
+      state.paused = !state.paused;
+      document.getElementById('pause-refresh').textContent = state.paused ? 'Resume Live' : 'Pause Live';
+      render(state.items);
+      if (!state.paused) refresh().catch((err) => {
+        document.getElementById('raw-status').textContent = String(err);
+      });
+    });
+    refresh().catch((err) => {
+      document.getElementById('raw-status').textContent = String(err);
+    });
+    setInterval(() => {
+      refresh().catch((err) => {
+        document.getElementById('raw-status').textContent = String(err);
+      });
+    }, 2500);
   </script>
 </body>
 </html>`

@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -53,6 +54,8 @@ type Server struct {
 	connWG                 sync.WaitGroup
 	debugEventsMu          sync.Mutex
 	debugEvents            []DebugEvent
+	rawMessagesMu          sync.Mutex
+	rawMessages            []RawDebugMessage
 }
 
 type DebugEvent struct {
@@ -67,6 +70,22 @@ type DebugEvent struct {
 	Status       string    `json:"status,omitempty"`
 	Reason       string    `json:"reason,omitempty"`
 	PayloadLen   int       `json:"payload_len"`
+}
+
+type RawDebugMessage struct {
+	Timestamp    time.Time          `json:"timestamp"`
+	Direction    string             `json:"direction"`
+	ControllerID string             `json:"controller_id"`
+	RemoteAddr   string             `json:"remote_addr,omitempty"`
+	CommandID    uint8              `json:"command_id"`
+	CommandSeq   uint8              `json:"command_seq"`
+	FrameMode    protocol.FrameMode `json:"frame_mode"`
+	TTL          uint8              `json:"ttl"`
+	RawHex       string             `json:"raw_hex"`
+	PayloadHex   string             `json:"payload_hex"`
+	PayloadLen   int                `json:"payload_len"`
+	MessageID    string             `json:"message_id,omitempty"`
+	TraceID      string             `json:"trace_id,omitempty"`
 }
 
 type ipSecurityState struct {
@@ -89,6 +108,7 @@ func New(cfg config.Config, logger *slog.Logger, sessions *session.Manager, bus 
 		ipConnCount:            make(map[string]int),
 		ipSec:                  make(map[string]*ipSecurityState),
 		debugEvents:            make([]DebugEvent, 0, 256),
+		rawMessages:            make([]RawDebugMessage, 0, 256),
 	}
 }
 
@@ -231,6 +251,20 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 			return
 		}
 
+		s.recordRawMessage(RawDebugMessage{
+			Timestamp:    time.Now().UTC(),
+			Direction:    "rx",
+			ControllerID: controllerID,
+			RemoteAddr:   remote,
+			CommandID:    cmdID,
+			CommandSeq:   frame.Seq,
+			FrameMode:    frame.Mode,
+			TTL:          frame.TTL,
+			RawHex:       encodeFrameHex(frame),
+			PayloadHex:   hex.EncodeToString(frame.Payload),
+			PayloadLen:   len(frame.Payload),
+		})
+
 		if !registered {
 			if cmdID != 1 {
 				s.registerIPViolation(remoteHost, time.Now().UTC())
@@ -250,7 +284,8 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 			}
 			frameMode = frame.Mode
 			s.sessions.SetFrameMode(id, frameMode)
-			if err := s.sendRegistrationAck(conn, frame.Mode, frame.Seq); err != nil {
+			rawAck, ackPayload, err := s.sendRegistrationAck(conn, frame.Mode, frame.Seq)
+			if err != nil {
 				if offErr := s.sessions.MarkOffline(id); offErr != nil {
 					s.logger.Error("failed to persist offline session state", "controller_id", s.logControllerID(id), "error", offErr)
 				}
@@ -268,6 +303,20 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 				TraceID:      newIncomingTraceID(id, protocol.CmdRegistrationAck, frame.Seq),
 				PayloadLen:   6,
 			})
+			s.recordRawMessage(RawDebugMessage{
+				Timestamp:    time.Now().UTC(),
+				Direction:    "tx",
+				ControllerID: id,
+				RemoteAddr:   remote,
+				CommandID:    protocol.CmdRegistrationAck,
+				CommandSeq:   frame.Seq,
+				FrameMode:    frame.Mode,
+				TTL:          255,
+				RawHex:       hex.EncodeToString(rawAck),
+				PayloadHex:   hex.EncodeToString(append([]byte{protocol.CmdRegistrationAck}, ackPayload...)),
+				PayloadLen:   6,
+				TraceID:      newIncomingTraceID(id, protocol.CmdRegistrationAck, frame.Seq),
+			})
 			registered = true
 			controllerID = id
 			lastHeartbeat = time.Now().UTC()
@@ -284,7 +333,8 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 			if err == nil {
 				lastHeartbeat = time.Now().UTC()
 				s.sessions.UpdateBufferFree(controllerID, int(st.BufferFree))
-				if err := s.sendControllerAck(conn, frame.Mode, frame.Seq, protocol.AckCodeOK); err != nil {
+				rawAck, ackPayload, err := s.sendControllerAck(conn, frame.Mode, frame.Seq, protocol.AckCodeOK)
+				if err != nil {
 					s.logger.Warn("status1 ack send failed", "remote", remote, "controller_id", s.logControllerID(controllerID), "error", err)
 					return
 				}
@@ -298,6 +348,20 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 					CommandSeq:   frame.Seq,
 					TraceID:      newIncomingTraceID(controllerID, protocol.CmdControllerAck, frame.Seq),
 					PayloadLen:   3,
+				})
+				s.recordRawMessage(RawDebugMessage{
+					Timestamp:    time.Now().UTC(),
+					Direction:    "tx",
+					ControllerID: controllerID,
+					RemoteAddr:   remote,
+					CommandID:    protocol.CmdControllerAck,
+					CommandSeq:   frame.Seq,
+					FrameMode:    frame.Mode,
+					TTL:          255,
+					RawHex:       hex.EncodeToString(rawAck),
+					PayloadHex:   hex.EncodeToString(append([]byte{protocol.CmdControllerAck}, ackPayload...)),
+					PayloadLen:   3,
+					TraceID:      newIncomingTraceID(controllerID, protocol.CmdControllerAck, frame.Seq),
 				})
 				// Controller advertises readiness for firmware update.
 				if protocol.Status1ReadyForFW(st.Flags) {
@@ -397,13 +461,17 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	}
 }
 
-func (s *Server) sendRegistrationAck(conn net.Conn, mode protocol.FrameMode, seq uint8) error {
-	payload, err := (protocol.Cmd1RegistrationAckPayload{
+func buildRegistrationAckPayload() ([]byte, error) {
+	return (protocol.Cmd1RegistrationAckPayload{
 		ExecutionCode: protocol.AckCodeOK,
 		ServerTime:    uint32(time.Now().Unix()),
 	}).Build()
+}
+
+func (s *Server) sendRegistrationAck(conn net.Conn, mode protocol.FrameMode, seq uint8) ([]byte, []byte, error) {
+	payload, err := buildRegistrationAckPayload()
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 
 	frame, err := protocol.EncodeFrame(protocol.Frame{
@@ -413,21 +481,25 @@ func (s *Server) sendRegistrationAck(conn net.Conn, mode protocol.FrameMode, seq
 		Mode:    mode,
 	})
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 
 	_ = conn.SetWriteDeadline(time.Now().Add(s.cfg.WriteTimeout))
 	_, err = conn.Write(frame)
-	return err
+	return frame, payload, err
 }
 
-func (s *Server) sendControllerAck(conn net.Conn, mode protocol.FrameMode, seq, code uint8) error {
-	payload, err := (protocol.Cmd24AckPayload{
+func buildControllerAckPayload(seq, code uint8) ([]byte, error) {
+	return (protocol.Cmd24AckPayload{
 		CommandSeq: seq,
 		Code:       code,
 	}).Build()
+}
+
+func (s *Server) sendControllerAck(conn net.Conn, mode protocol.FrameMode, seq, code uint8) ([]byte, []byte, error) {
+	payload, err := buildControllerAckPayload(seq, code)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 
 	frame, err := protocol.EncodeFrame(protocol.Frame{
@@ -437,12 +509,12 @@ func (s *Server) sendControllerAck(conn net.Conn, mode protocol.FrameMode, seq, 
 		Mode:    mode,
 	})
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 
 	_ = conn.SetWriteDeadline(time.Now().Add(s.cfg.WriteTimeout))
 	_, err = conn.Write(frame)
-	return err
+	return frame, payload, err
 }
 
 func (s *Server) flushQueue(ctx context.Context, controllerID string) error {
@@ -581,6 +653,21 @@ func (s *Server) flushQueue(ctx context.Context, controllerID string) error {
 				MessageID:    cmd.MessageID,
 				TraceID:      cmd.TraceID,
 				PayloadLen:   len(cmd.Payload) + 1,
+			})
+			s.recordRawMessage(RawDebugMessage{
+				Timestamp:    time.Now().UTC(),
+				Direction:    "tx",
+				ControllerID: controllerID,
+				RemoteAddr:   dctx.Conn.RemoteAddr().String(),
+				CommandID:    cmd.CommandID,
+				CommandSeq:   seq,
+				FrameMode:    dctx.FrameMode,
+				TTL:          ttlToWire(cmd.TTL),
+				RawHex:       hex.EncodeToString(frameBytes),
+				PayloadHex:   hex.EncodeToString(payload),
+				PayloadLen:   len(payload),
+				MessageID:    cmd.MessageID,
+				TraceID:      cmd.TraceID,
 			})
 			remaining -= len(frameBytes)
 			s.publishAck(ctx, kafka.AckEvent{MessageID: cmd.MessageID, TraceID: cmd.TraceID, ControllerID: controllerID, CommandID: cmd.CommandID, Status: "accepted", CommandSeq: seq})
@@ -856,6 +943,7 @@ func connRemoteHost(conn net.Conn) string {
 }
 
 const maxDebugEvents = 256
+const maxRawDebugMessages = 256
 
 func (s *Server) recordDebugEvent(event DebugEvent) {
 	if !s.cfg.DebugLogs {
@@ -880,6 +968,39 @@ func (s *Server) debugEventsSnapshot(limit int) []DebugEvent {
 		out = append(out, s.debugEvents[i])
 	}
 	return out
+}
+
+func (s *Server) recordRawMessage(msg RawDebugMessage) {
+	if !s.cfg.DebugLogs {
+		return
+	}
+	s.rawMessagesMu.Lock()
+	defer s.rawMessagesMu.Unlock()
+	s.rawMessages = append(s.rawMessages, msg)
+	if len(s.rawMessages) > maxRawDebugMessages {
+		s.rawMessages = append([]RawDebugMessage(nil), s.rawMessages[len(s.rawMessages)-maxRawDebugMessages:]...)
+	}
+}
+
+func (s *Server) rawMessagesSnapshot(limit int) []RawDebugMessage {
+	s.rawMessagesMu.Lock()
+	defer s.rawMessagesMu.Unlock()
+	if limit <= 0 || limit > len(s.rawMessages) {
+		limit = len(s.rawMessages)
+	}
+	out := make([]RawDebugMessage, 0, limit)
+	for i := len(s.rawMessages) - 1; i >= 0 && len(out) < limit; i-- {
+		out = append(out, s.rawMessages[i])
+	}
+	return out
+}
+
+func encodeFrameHex(frame protocol.Frame) string {
+	wire, err := protocol.EncodeFrame(frame)
+	if err != nil {
+		return ""
+	}
+	return hex.EncodeToString(wire)
 }
 
 func newIncomingTraceID(controllerID string, cmdID, seq uint8) string {

@@ -165,7 +165,7 @@ func TestIndexHandler(t *testing.T) {
 		t.Fatalf("expected 200, got %d", rr.Code)
 	}
 	body := rr.Body.String()
-	if !strings.Contains(body, "/healthz") || !strings.Contains(body, "/metrics") || !strings.Contains(body, "/debug/dashboard") || !strings.Contains(body, "/debug/queues?limit=20") || !strings.Contains(body, "/debug/logs") {
+	if !strings.Contains(body, "/healthz") || !strings.Contains(body, "/metrics") || !strings.Contains(body, "/debug/dashboard") || !strings.Contains(body, "/debug/queues?limit=20") || !strings.Contains(body, "/debug/logs") || !strings.Contains(body, "/debug/raw") {
 		t.Fatalf("expected endpoint links in body, got: %s", body)
 	}
 	if !strings.Contains(body, "build-badge") {
@@ -446,6 +446,19 @@ func TestDebugDashboardAndEventsHandlers(t *testing.T) {
 		CommandSeq:   1,
 		Status:       "accepted",
 	})
+	srv.recordRawMessage(RawDebugMessage{
+		Timestamp:    time.Now().UTC(),
+		Direction:    "rx",
+		ControllerID: "imei-dash",
+		RemoteAddr:   "127.0.0.1:12345",
+		CommandID:    1,
+		CommandSeq:   0,
+		FrameMode:    2,
+		TTL:          255,
+		RawHex:       "534c444e0100ff012345",
+		PayloadHex:   "01313233",
+		PayloadLen:   4,
+	})
 
 	req := httptest.NewRequest("GET", "/debug/dashboard?limit=10", nil)
 	rr := httptest.NewRecorder()
@@ -500,6 +513,33 @@ func TestDebugDashboardAndEventsHandlers(t *testing.T) {
 	}
 	if events.Count == 0 || len(events.Items) == 0 {
 		t.Fatalf("unexpected events payload: %+v", events)
+	}
+
+	req = httptest.NewRequest("GET", "/debug/raw-messages?limit=5", nil)
+	rr = httptest.NewRecorder()
+	srv.debugRawMessagesHandler(rr, req)
+	if rr.Code != 200 {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+	var raw struct {
+		Count int               `json:"count"`
+		Items []RawDebugMessage `json:"items"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("raw messages json decode error: %v", err)
+	}
+	if raw.Count == 0 || len(raw.Items) == 0 || raw.Items[0].RawHex == "" {
+		t.Fatalf("unexpected raw messages payload: %+v", raw)
+	}
+
+	req = httptest.NewRequest("GET", "/debug/raw", nil)
+	rr = httptest.NewRecorder()
+	srv.debugRawHandler(rr, req)
+	if rr.Code != 200 {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "Raw Wire Messages") || !strings.Contains(rr.Body.String(), "/debug/raw-messages") {
+		t.Fatalf("unexpected raw debug page: %s", rr.Body.String())
 	}
 }
 
