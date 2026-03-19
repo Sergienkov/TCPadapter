@@ -257,6 +257,17 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 				s.logger.Warn("registration ack send failed", "remote", remote, "controller_id", s.logControllerID(id), "error", err)
 				return
 			}
+			s.logger.Info("registration ack sent", "controller_id", s.logControllerID(id), "remote", remote, "seq", frame.Seq, "frame_mode", frame.Mode)
+			s.recordDebugEvent(DebugEvent{
+				Timestamp:    time.Now().UTC(),
+				Kind:         "tx",
+				ControllerID: id,
+				RemoteAddr:   remote,
+				CommandID:    protocol.CmdRegistrationAck,
+				CommandSeq:   frame.Seq,
+				TraceID:      newIncomingTraceID(id, protocol.CmdRegistrationAck, frame.Seq),
+				PayloadLen:   6,
+			})
 			registered = true
 			controllerID = id
 			lastHeartbeat = time.Now().UTC()
@@ -277,6 +288,17 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 					s.logger.Warn("status1 ack send failed", "remote", remote, "controller_id", s.logControllerID(controllerID), "error", err)
 					return
 				}
+				s.logger.Info("status1 ack sent", "controller_id", s.logControllerID(controllerID), "remote", remote, "seq", frame.Seq, "frame_mode", frame.Mode)
+				s.recordDebugEvent(DebugEvent{
+					Timestamp:    time.Now().UTC(),
+					Kind:         "tx",
+					ControllerID: controllerID,
+					RemoteAddr:   remote,
+					CommandID:    protocol.CmdControllerAck,
+					CommandSeq:   frame.Seq,
+					TraceID:      newIncomingTraceID(controllerID, protocol.CmdControllerAck, frame.Seq),
+					PayloadLen:   3,
+				})
 				// Controller advertises readiness for firmware update.
 				if protocol.Status1ReadyForFW(st.Flags) {
 					if err := s.sessions.SetFWMode(controllerID, true); err != nil {
