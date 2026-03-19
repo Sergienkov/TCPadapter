@@ -683,6 +683,89 @@ func TestE2EHeartbeatTimeoutDisconnectsWithoutStatus1(t *testing.T) {
 	}
 }
 
+func TestE2EStatus1IsAcknowledgedWithCmd24(t *testing.T) {
+	listenAddr := freeTCPAddr(t)
+	metricsAddr := freeTCPAddr(t)
+
+	cfg := config.Config{
+		ListenAddr:         listenAddr,
+		MetricsAddr:        metricsAddr,
+		RegistrationWindow: 2 * time.Second,
+		HeartbeatTimeout:   2 * time.Second,
+		MaxConnections:     100,
+		MaxQueueDepth:      100,
+		MaxQueueBytes:      1 << 20,
+		QueueOverflow:      "drop_oldest",
+		AckTimeout:         150 * time.Millisecond,
+		RetryBackoff:       50 * time.Millisecond,
+		MaxRetries:         2,
+		SweepInterval:      40 * time.Millisecond,
+		WriteTimeout:       1 * time.Second,
+		ReadTimeout:        5 * time.Second,
+		DebugLogs:          false,
+		StateFile:          "",
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	sessions := session.NewManager(cfg.MaxConnections, cfg.MaxQueueDepth, cfg.MaxQueueBytes, cfg.QueueOverflow, store.NewInMemoryStore())
+	srv := New(cfg, logger, sessions, &captureBus{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.Run(ctx) }()
+	waitTCPReady(t, listenAddr, 3*time.Second)
+
+	conn, err := net.DialTimeout("tcp", listenAddr, 500*time.Millisecond)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	if err := writeFrame(conn, buildRegistrationPayload("860000000000333")); err != nil {
+		t.Fatalf("registration write failed: %v", err)
+	}
+
+	r := bufio.NewReader(conn)
+	_ = conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+	if _, err := protocol.ReadFrame(r); err != nil {
+		t.Fatalf("read registration ack failed: %v", err)
+	}
+
+	statusSeq := uint8(37)
+	if err := writeWireFrame(conn, protocol.Frame{TTL: 255, Seq: statusSeq, Payload: buildStatus1Payload(1500), Mode: protocol.FrameModeSequenced}); err != nil {
+		t.Fatalf("status1 write failed: %v", err)
+	}
+
+	_ = conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+	frame, err := protocol.ReadFrame(r)
+	if err != nil {
+		t.Fatalf("read status1 ack failed: %v", err)
+	}
+	if cmdID, ok := frame.CommandID(); !ok || cmdID != protocol.CmdControllerAck {
+		t.Fatalf("expected cmd=24 controller ack, got ok=%v cmd=%d", ok, cmdID)
+	}
+	if len(frame.Payload) < 3 {
+		t.Fatalf("unexpected controller ack payload len: %d", len(frame.Payload))
+	}
+	if frame.Payload[1] != statusSeq {
+		t.Fatalf("expected ack seq=%d, got %d", statusSeq, frame.Payload[1])
+	}
+	if frame.Payload[2] != protocol.AckCodeOK {
+		t.Fatalf("expected ack code=0, got %d", frame.Payload[2])
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("server run error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not stop in time")
+	}
+}
+
 func runControllerDropFirstAck(t *testing.T, ctx context.Context, addr, imei string) {
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -1018,7 +1101,11 @@ func waitTCPReady(t *testing.T, addr string, timeout time.Duration) {
 }
 
 func writeFrame(conn net.Conn, payload []byte) error {
-	wire, err := protocol.EncodeFrame(protocol.Frame{TTL: 255, Seq: 1, Payload: payload})
+	return writeWireFrame(conn, protocol.Frame{TTL: 255, Seq: 1, Payload: payload, Mode: protocol.FrameModeSequenced})
+}
+
+func writeWireFrame(conn net.Conn, frame protocol.Frame) error {
+	wire, err := protocol.EncodeFrame(frame)
 	if err != nil {
 		return err
 	}

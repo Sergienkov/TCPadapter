@@ -273,6 +273,10 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 			if err == nil {
 				lastHeartbeat = time.Now().UTC()
 				s.sessions.UpdateBufferFree(controllerID, int(st.BufferFree))
+				if err := s.sendControllerAck(conn, frame.Mode, frame.Seq, protocol.AckCodeOK); err != nil {
+					s.logger.Warn("status1 ack send failed", "remote", remote, "controller_id", s.logControllerID(controllerID), "error", err)
+					return
+				}
 				// Controller advertises readiness for firmware update.
 				if protocol.Status1ReadyForFW(st.Flags) {
 					if err := s.sessions.SetFWMode(controllerID, true); err != nil {
@@ -384,6 +388,30 @@ func (s *Server) sendRegistrationAck(conn net.Conn, mode protocol.FrameMode, seq
 		TTL:     255,
 		Seq:     seq,
 		Payload: append([]byte{protocol.CmdRegistrationAck}, payload...),
+		Mode:    mode,
+	})
+	if err != nil {
+		return err
+	}
+
+	_ = conn.SetWriteDeadline(time.Now().Add(s.cfg.WriteTimeout))
+	_, err = conn.Write(frame)
+	return err
+}
+
+func (s *Server) sendControllerAck(conn net.Conn, mode protocol.FrameMode, seq, code uint8) error {
+	payload, err := (protocol.Cmd24AckPayload{
+		CommandSeq: seq,
+		Code:       code,
+	}).Build()
+	if err != nil {
+		return err
+	}
+
+	frame, err := protocol.EncodeFrame(protocol.Frame{
+		TTL:     255,
+		Seq:     seq,
+		Payload: append([]byte{protocol.CmdControllerAck}, payload...),
 		Mode:    mode,
 	})
 	if err != nil {
